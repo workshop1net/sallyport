@@ -112,6 +112,7 @@ class State:
         self.lock = threading.Lock()
         self.job = None
         self.last_seen = time.time()
+        self.update = {"folder": None, "state": "idle"}
         self.folder = None
         self.set_folder(folder)
 
@@ -177,6 +178,116 @@ def stack_mode(state):
 def compose_cmd(state, *args):
     files = ["-f", "compose.yaml", "-f", "compose.dev.yaml"] if stack_mode(state) == "dev" else []
     return ["docker", "compose", "--progress", "plain", *files, *args]
+
+
+# ---------------------------------------------------------------- update checking
+
+def git(folder, *args, timeout=30):
+    return run_quiet(["git", "-C", str(folder), *args], timeout=timeout)
+
+
+def initialised(folder):
+    return (folder / ".env").exists() and (folder / "generated" / "pomerium.yaml").exists()
+
+
+def plan_for(folder, files):
+    """What an update touching these files needs done, in order."""
+    files = set(files)
+    core_changed = bool(files & {"sallyport_core.py", "sallyport"})
+    gui_changed = bool(files & {"sallyport_gui.py", "sallyport_core.py", "sallyport"})
+    compose = bool(files & {"compose.yaml", "compose.dev.yaml"})
+    init_needed = initialised(folder) and (compose or core_changed or any(f.startswith(("sql/", "tools/")) for f in files))
+    steps = []
+    if init_needed:
+        steps.append({"id": "init", "text": "Regenerate the configuration (Initialise)"})
+    if initialised(folder) and (init_needed or compose):
+        steps.append({"id": "restart", "text": "Recreate the containers (interrupts any active sessions)"})
+    if initialised(folder) and core_changed:
+        steps.append({"id": "load_targets", "text": "Reload the targets"})
+    notes = []
+    if any(f.startswith("sql/") for f in files):
+        notes.append("Database setup scripts changed. They only run when a database is first created, so an existing "
+                     "install needs them applied by hand (see README, Upgrades).")
+    if gui_changed:
+        notes.append("This control panel's own code changed: close it and start it again afterwards to use the new version.")
+    return {"steps": steps, "notes": notes, "gui_changed": gui_changed}
+
+
+def update_worker(state, folder, u):
+    def finish(**kw):
+        if u.get("folder") == str(folder):
+            u.update(kw)
+
+    checks = check_environment(state)
+    if not all(c["ok"] for c in checks):
+        return finish(state="skipped", message="Environment checks have not all passed, so updates were not checked.")
+    if not (folder / ".git").exists():
+        return finish(state="skipped", message="This folder is not a git checkout, so updates cannot be checked.")
+    rc, upstream, err = git(folder, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
+    if rc != 0:
+        return finish(state="skipped", message="This checkout has no upstream branch to compare with.")
+    rc, out, err = git(folder, "fetch", "--quiet", timeout=90)
+    if rc != 0:
+        return finish(state="error", message="Could not reach the repository: " + (err or out or "git fetch failed"))
+    rc, out, err = git(folder, "rev-list", "--left-right", "--count", "HEAD...@{u}")
+    try:
+        ahead, behind = (int(x) for x in out.split())
+    except ValueError:
+        return finish(state="error", message="Could not compare with the upstream branch: " + (err or out))
+    rc, head, _ = git(folder, "rev-parse", "--short", "HEAD")
+    if behind == 0:
+        return finish(state="current", head=head, message="Up to date.", ahead=ahead)
+    if ahead:
+        return finish(state="diverged", head=head, ahead=ahead, behind=behind,
+                      message=f"This checkout has {ahead} local commit(s) and is {behind} behind; update it by hand with git.")
+    rc, dirty, _ = git(folder, "status", "--porcelain", "--untracked-files=no")
+    rc, subjects, _ = git(folder, "log", "--format=%h %s", "-n", "8", "HEAD..@{u}")
+    rc, files, _ = git(folder, "diff", "--name-only", "HEAD..@{u}")
+    plan = plan_for(folder, [f for f in files.splitlines() if f])
+    finish(state="behind", head=head, behind=behind, commits=subjects.splitlines(), plan=plan,
+           dirty=bool(dirty), message=f"{behind} new commit(s) available.")
+
+
+def update_status(state, force=False):
+    with state.lock:
+        u = state.update
+        if u.get("state") == "checking":
+            return dict(u)
+        if force or u.get("folder") != str(state.folder):
+            u = state.update = {"folder": str(state.folder), "state": "checking", "message": "Checking for updates…"}
+            threading.Thread(target=update_worker, args=(state, state.folder, u), daemon=True).start()
+        return dict(u)
+
+
+def action_update(state, job, body):
+    """Pull, then apply what the new files need. Steps that depend on the code just pulled run
+    as fresh processes: this process still has the old code loaded."""
+    folder = state.folder
+    apply_changes, images = bool(body.get("apply")), bool(body.get("images"))
+    rc, files, _ = git(folder, "diff", "--name-only", "HEAD..@{u}")
+    plan = plan_for(folder, [f for f in files.splitlines() if f]) if rc == 0 else {"steps": [], "notes": [], "gui_changed": False}
+    if not run_process(job, ["git", "pull", "--ff-only"], folder):
+        return False
+    ids = {st["id"] for st in plan["steps"]}
+    me = [sys.executable, "-I", str(folder / "sallyport")]
+    if apply_changes:
+        if "init" in ids and not run_process(job, me + ["init"], folder):
+            return False
+        if images and initialised(folder) and not run_process(job, compose_cmd(state, "pull"), folder):
+            return False
+        if ("restart" in ids or (images and initialised(folder))) and not run_process(
+                job, compose_cmd(state, "up", "-d", "--force-recreate"), folder):
+            return False
+        if "load_targets" in ids and not run_process(job, me + ["load-targets"], folder):
+            return False
+    else:
+        job.add("Pulled only. Steps still to do: " + (", ".join(st["text"] for st in plan["steps"]) or "none"))
+    for note in plan["notes"]:
+        job.add("NOTE: " + note)
+    job.add("Update finished.")
+    with state.lock:
+        state.update = {"folder": None, "state": "idle"}  # forces a fresh check
+    return True
 
 
 # ------------------------------------------------------------------------- jobs
@@ -270,12 +381,12 @@ def make_action(name):
         args = ["logs", "--tail", "200"] + ([service] if service else [])
         return need_checkout(state, job) and run_process(job, compose_cmd(state, *args), state.folder)
 
-    return {"clone": action_clone_or_pull, "init": init, "up": up, "restart": restart, "down": down,
+    return {"update": action_update, "clone": action_clone_or_pull, "init": init, "up": up, "restart": restart, "down": down,
             "load_targets": load_targets, "dry_run": dry_run, "check": check, "ps": ps,
             "logs": logs}.get(name)
 
 
-TITLES = {"clone": "Clone / update", "init": "Initialise", "up": "Start", "restart": "Restart (recreate)",
+TITLES = {"update": "Update", "clone": "Clone / update", "init": "Initialise", "up": "Start", "restart": "Restart (recreate)",
           "down": "Stop", "load_targets": "Load targets", "dry_run": "Targets dry run", "check": "Check",
           "ps": "Status", "logs": "Logs"}
 
@@ -472,6 +583,8 @@ class Handler(BaseHTTPRequestHandler):
             s = load_settings()
             return self.reply(200, {"folder": str(self.state.folder), "repo": s.get("repo", DEFAULT_REPO),
                                     "checks": check_environment(self.state), "mode": stack_mode(self.state)})
+        if url.path == "/api/update":
+            return self.reply(200, update_status(self.state, force=(q.get("force") or ["0"])[0] == "1"))
         if url.path == "/api/job":
             job = self.state.job
             since = int((q.get("since") or ["0"])[0] or 0)
@@ -589,6 +702,7 @@ def main():
                 return
 
     threading.Thread(target=watchdog, daemon=True).start()
+    update_status(state)  # start the update check now; the page shows the result
     if not args.no_browser:
         webbrowser.open(url)
     try:
@@ -627,6 +741,9 @@ textarea.small{height:70px;font:12.5px/1.4 Consolas,monospace}
 .tlist div{padding:6px 8px;cursor:pointer;border-bottom:1px solid var(--bd)}.tlist div.on{background:#4a90d933;font-weight:600}
 .tlist small{opacity:.7;display:block}
 .hide{display:none!important}
+.banner{border:1px solid var(--bd);border-radius:8px;padding:8px 12px;margin-bottom:12px}
+.banner.upd{background:#4a90d922;border-color:#4a90d9}.banner ul{margin:4px 0 6px;padding-left:20px}
+.banner.bad{background:#c6282822}
 #outpanel{position:sticky;bottom:0;background:Canvas;color:CanvasText;border-top:2px solid var(--bd);padding:6px 0 8px;margin-top:10px}
 body{padding-bottom:0}
 details summary{cursor:pointer;margin-bottom:8px}
@@ -634,8 +751,11 @@ details summary{cursor:pointer;margin-bottom:8px}
 </style></head><body>
 <h1>Sallyport</h1><div class="sub">Local control panel &mdash; listening on 127.0.0.1 only. <button id="quit">Quit</button></div>
 
-<section><h2>1. Checks</h2><div id="checks" class="chk">loading&hellip;</div>
-<div class="row"><button id="recheck">Check again</button></div></section>
+<div id="banner"></div>
+
+<section><details id="envd"><summary><b>1. Checks</b> <span id="envsum" class="sub"></span></summary>
+<div id="checks" class="chk">loading&hellip;</div>
+<div class="row"><button id="recheck">Check again</button></div></details></section>
 
 <section><h2>2. Folder and repository</h2>
 <div class="row"><label for="folder">Folder</label><input type="text" id="folder"></div>
@@ -729,6 +849,38 @@ async function refresh(){
     const d=document.createElement("span");d.textContent=k.detail;
     c.append(a,b,d);
   }
+  const allOk=s.checks.every(k=>k.ok);
+  $("#envsum").textContent=allOk?"— all passed ✔":"— problems found ✘";
+  if(!allOk)$("#envd").open=true; else if(!window._envShown)$("#envd").open=false;
+  window._envShown=true;
+}
+function bannerBox(cls){const b=$("#banner");b.textContent="";const d=document.createElement("div");d.className="banner "+(cls||"");b.appendChild(d);return d}
+function li(ul,t){const l=document.createElement("li");l.textContent=t;ul.appendChild(l)}
+let updTimer=null;
+async function checkUpdate(force){
+  clearTimeout(updTimer);
+  let u; try{u=await api("/api/update"+(force?"?force=1":""))}catch(e){return}
+  if(u.state==="checking"){const d=bannerBox();d.textContent=u.message;updTimer=setTimeout(()=>checkUpdate(false),1500);return}
+  if(u.state==="idle"){return}
+  if(u.state==="current"){const d=bannerBox();d.textContent="✔ Up to date (commit "+u.head+"). ";
+    const b=document.createElement("button");b.textContent="Check again";b.onclick=()=>checkUpdate(true);d.appendChild(b);return}
+  if(u.state==="skipped"){const d=bannerBox();d.textContent=u.message;return}
+  if(u.state==="error"||u.state==="diverged"){const d=bannerBox("bad");d.textContent=u.message+" ";
+    const b=document.createElement("button");b.textContent="Retry";b.onclick=()=>checkUpdate(true);d.appendChild(b);return}
+  if(u.state==="behind"){
+    const d=bannerBox("upd");const h=document.createElement("b");h.textContent="Update available: "+u.message;d.appendChild(h);
+    const ul=document.createElement("ul");u.commits.forEach(c=>li(ul,c));d.appendChild(ul);
+    if(u.plan.steps.length){const p=document.createElement("div");p.textContent="Updating and applying will:";d.appendChild(p);
+      const ol=document.createElement("ul");li(ol,"Pull the new version");u.plan.steps.forEach(x=>li(ol,x.text));d.appendChild(ol)}
+    else{const p=document.createElement("div");p.textContent="Nothing needs re-applying after the pull.";d.appendChild(p)}
+    u.plan.notes.forEach(n=>{const p=document.createElement("div");p.className="sub";p.textContent="⚠ "+n;d.appendChild(p)});
+    if(u.dirty){const p=document.createElement("div");p.className="bad";p.textContent="This checkout has local changes to tracked files; the pull may refuse to run.";d.appendChild(p)}
+    const row=document.createElement("div");row.className="row";
+    const cb=document.createElement("input");cb.type="checkbox";cb.id="u_images";const lb=document.createElement("label");lb.htmlFor="u_images";lb.textContent="Also pull newer container images (they use :latest) and recreate the containers";
+    const go=document.createElement("button");go.className="p";go.textContent="Update and apply";go.onclick=()=>run("update",{apply:true,images:cb.checked});
+    const only=document.createElement("button");only.textContent="Pull only";only.onclick=()=>run("update",{apply:false});
+    row.append(go,only,cb,lb);d.appendChild(row);
+  }
 }
 async function loadFile(){
   const f=await api("/api/file?name="+encodeURIComponent(cur));
@@ -753,12 +905,12 @@ async function poll(){
     if(j.done){ if(j.ok===true){say("✔ done","ok");setState("✔ done","ok")} else if(j.ok===false){say("✘ failed","bad");setState("✘ failed","bad")} break;}
     await new Promise(r=>setTimeout(r,700));
   }}catch(e){say("error: "+e.message,"bad")}
-  polling=false; refresh().catch(()=>{}); loadFile().catch(()=>{}); loadForms().catch(()=>{});
+  polling=false; checkUpdate(false); refresh().catch(()=>{}); loadFile().catch(()=>{}); loadForms().catch(()=>{});
 }
 $("#outclear").onclick=()=>{$("#out").textContent="";setState("","")};
 $("#clone").onclick=()=>run("clone",{repo:$("#repo").value});
 $$("button[data-a]").forEach(b=>b.onclick=()=>run(b.dataset.a));
-$("#recheck").onclick=async()=>{try{await folderSet();await refresh();await loadFile();await loadForms()}catch(e){say("error: "+e.message,"bad")}};
+$("#recheck").onclick=async()=>{try{await folderSet();await refresh();await loadFile();await loadForms();checkUpdate(true)}catch(e){say("error: "+e.message,"bad")}};
 $$(".tabs button[data-f]").forEach(b=>b.onclick=async()=>{
   $$(".tabs button[data-f]").forEach(x=>x.classList.toggle("on",x===b)); cur=b.dataset.f;
   try{await folderSet();await loadFile()}catch(e){$("#fmsg").className="msg bad";$("#fmsg").textContent=e.message}});
@@ -864,7 +1016,7 @@ $("#t_show").onclick=()=>{const i=$("#t_password");i.type=i.type==="password"?"t
 async function loadForms(){await loadCfg();await loadTargets()}
 
 setInterval(()=>api("/api/ping").catch(()=>{}),20000);
-refresh().then(loadFile).then(loadForms).catch(e=>{document.body.textContent="Cannot reach the Sallyport GUI: "+e.message+" (was it closed? run it again)"});
+refresh().then(()=>checkUpdate(false)).then(loadFile).then(loadForms).catch(e=>{document.body.textContent="Cannot reach the Sallyport GUI: "+e.message+" (was it closed? run it again)"});
 </script></body></html>
 """
 
