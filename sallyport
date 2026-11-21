@@ -80,8 +80,39 @@ def nonempty_str(section, key, value, maxlen=4000):
 
 # ---------------------------------------------------------------- config / init
 
+DEV_EMAIL = "kilgore@kilgore.kilgore"  # the fixed user Dex's mock connector signs in
+DEV_CLIENT_ID = "sallyport"
+
+
+def parse_session(cfg):
+    session = cfg.get("session") or {}
+    check_keys("session", session, {"lifetime", "idle_timeout"})
+    lifetime = str(session.get("lifetime", "8h"))
+    idle = str(session.get("idle_timeout", "30m"))
+    for key, value in (("lifetime", lifetime), ("idle_timeout", idle)):
+        if not DURATION_RE.match(value):
+            die(f"session.{key} must look like 30m or 8h")
+    return lifetime, idle
+
+
+def validate_dev(cfg):
+    check_keys("sallyport.yaml (dev mode)", cfg, {"mode", "domain", "session"}, required=("domain",))
+    domain = str(cfg["domain"]).lower()
+    if not DOMAIN_RE.match(domain) or not domain.endswith(".localhost"):
+        die("dev mode only runs on *.localhost names (for example access.localhost); "
+            "it uses a throwaway login and an untrusted certificate and must never face a network")
+    lifetime, idle = parse_session(cfg)
+    return {"mode": "dev", "domain": domain, "emails": [DEV_EMAIL], "groups": [], "groups_claim": "groups",
+            "lifetime": lifetime, "idle": idle, "client_secret": None}
+
+
 def validate_config(cfg):
-    check_keys("sallyport.yaml", cfg, {"domain", "acme_email", "acme_staging", "idp", "access", "session"},
+    mode = cfg.get("mode", "production")
+    if mode not in ("production", "dev"):
+        die("mode must be production or dev")
+    if mode == "dev":
+        return validate_dev(cfg)
+    check_keys("sallyport.yaml", cfg, {"mode", "domain", "acme_email", "acme_staging", "idp", "access", "session"},
                required=("domain", "acme_email", "idp", "access"))
     domain = str(cfg["domain"]).lower()
     if not DOMAIN_RE.match(domain):
@@ -130,16 +161,10 @@ def validate_config(cfg):
     if not isinstance(claim, str) or not CLAIM_RE.match(claim):
         die("access.groups_claim is not a valid claim name")
 
-    session = cfg.get("session") or {}
-    check_keys("session", session, {"lifetime", "idle_timeout"})
-    lifetime = str(session.get("lifetime", "8h"))
-    idle = str(session.get("idle_timeout", "30m"))
-    for key, value in (("lifetime", lifetime), ("idle_timeout", idle)):
-        if not DURATION_RE.match(value):
-            die(f"session.{key} must look like 30m or 8h")
+    lifetime, idle = parse_session(cfg)
 
     return {
-        "domain": domain, "acme_email": email, "staging": staging,
+        "mode": "production", "domain": domain, "acme_email": email, "staging": staging,
         "issuer": idp["issuer"], "client_id": idp["client_id"], "client_secret": idp["client_secret"],
         "scopes": scopes, "emails": [e.strip() for e in emails], "groups": groups,
         "groups_claim": claim, "lifetime": lifetime, "idle": idle,
@@ -164,17 +189,24 @@ def write_private(path, text):
 
 
 def render_pomerium(c):
+    dev = c["mode"] == "dev"
     policy = [{"email": {"is": e}} for e in c["emails"]]
     policy += [{f"claim/{c['groups_claim']}": g} for g in c["groups"]]
+    if dev:
+        tls = {
+            "certificates": [{"cert": "/pomerium/certs/tls.crt", "key": "/pomerium/certs/tls.key"}],
+            "certificate_authority_file": "/pomerium/certs/ca.crt",
+        }
+        idp = {"idp_provider_url": f"https://dex.{c['domain']}:5556/dex", "idp_client_id": DEV_CLIENT_ID,
+               "idp_scopes": ["openid", "profile", "email"]}
+    else:
+        tls = {"autocert": True, "autocert_email": c["acme_email"], "autocert_use_staging": c["staging"]}
+        idp = {"idp_provider_url": c["issuer"], "idp_client_id": c["client_id"], "idp_scopes": c["scopes"]}
     config = {
-        "autocert": True,
-        "autocert_email": c["acme_email"],
-        "autocert_use_staging": c["staging"],
+        **tls,
         "authenticate_service_url": f"https://authenticate.{c['domain']}",
         "idp_provider": "oidc",
-        "idp_provider_url": c["issuer"],
-        "idp_client_id": c["client_id"],
-        "idp_scopes": c["scopes"],
+        **idp,
         "cookie_expire": c["lifetime"],
         "jwt_claims_headers": {"X-Pomerium-Claim-Email": "email"},
         "routes": [{
@@ -192,6 +224,61 @@ def render_pomerium(c):
     return header + yaml.safe_dump(config, sort_keys=False)
 
 
+def run_openssl(*args):
+    result = subprocess.run(["openssl", *args], capture_output=True, text=True)
+    if result.returncode != 0:
+        die(f"openssl failed: {result.stderr.strip()}")
+
+
+def init_dev(c, env):
+    """Dev mode: private CA + server certificate, Dex config, and a throwaway SSH target."""
+    if not shutil.which("openssl"):
+        die("openssl is required for dev mode (on Windows, use sallyport.cmd, which includes it)")
+    domain = c["domain"]
+    certs = GEN / "certs"
+    certs.mkdir(exist_ok=True)
+    marker = certs / "domain"
+    if not (certs / "tls.crt").exists() or not marker.exists() or marker.read_text() != domain:
+        names = [domain, f"authenticate.{domain}", f"dex.{domain}"]
+        run_openssl("req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "30",
+                    "-keyout", str(certs / "ca.key"), "-out", str(certs / "ca.crt"),
+                    "-subj", "/CN=Sallyport dev CA (do not trust)",
+                    "-addext", "basicConstraints=critical,CA:TRUE", "-addext", "keyUsage=critical,keyCertSign,cRLSign")
+        run_openssl("req", "-newkey", "rsa:2048", "-nodes", "-keyout", str(certs / "tls.key"),
+                    "-out", str(certs / "tls.csr"), "-subj", f"/CN={domain}")
+        ext = certs / "ext.cnf"
+        ext.write_text("basicConstraints=CA:FALSE\nextendedKeyUsage=serverAuth\n"
+                       "subjectAltName=" + ",".join(f"DNS:{n}" for n in names) + "\n")
+        run_openssl("x509", "-req", "-in", str(certs / "tls.csr"), "-CA", str(certs / "ca.crt"),
+                    "-CAkey", str(certs / "ca.key"), "-CAcreateserial", "-days", "30",
+                    "-extfile", str(ext), "-out", str(certs / "tls.crt"))
+        marker.write_text(domain)
+        print("generated a throwaway CA and certificate (valid 30 days)")
+    # Dev only: the containers run as unprivileged users and must be able to read the key.
+    for f in ("tls.key", "tls.crt", "ca.crt"):
+        os.chmod(certs / f, 0o644)
+
+    dex = {
+        "issuer": f"https://dex.{domain}:5556/dex",
+        "storage": {"type": "memory"},
+        "web": {"https": "0.0.0.0:5556", "tlsCert": "/certs/tls.crt", "tlsKey": "/certs/tls.key"},
+        "oauth2": {"skipApprovalScreen": True},
+        "connectors": [{"type": "mockCallback", "id": "mock", "name": "Sallyport dev login"}],
+        "staticClients": [{
+            "id": DEV_CLIENT_ID, "name": "Sallyport", "secret": env["IDP_CLIENT_SECRET"],
+            "redirectURIs": [f"https://authenticate.{domain}/oauth2/callback"],
+        }],
+    }
+    (GEN / "dex.yaml").write_text("# Generated by ./sallyport init (dev mode). Do not edit.\n" + yaml.safe_dump(dex, sort_keys=False))
+
+    if not TARGETS.exists():
+        TARGETS.write_text(
+            "# Dev mode test target: a throwaway SSH server container from compose.dev.yaml.\n"
+            "targets:\n  - name: sshtest\n    protocol: ssh\n    host: sshtest\n    port: 2222\n"
+            "    username: test\n    password: test\n")
+        print("wrote targets.yaml with a test SSH target")
+
+
 def cmd_init(args):
     c = validate_config(load_yaml(CONFIG))
     env = read_env()
@@ -205,13 +292,24 @@ def cmd_init(args):
         if key not in env:
             env[key] = gen()
             new.append(key)
-    env["IDP_CLIENT_SECRET"] = c["client_secret"]
+    if c["mode"] == "dev":
+        if "IDP_CLIENT_SECRET" not in env or env.get("SALLYPORT_MODE") != "dev":
+            env["IDP_CLIENT_SECRET"] = secrets.token_hex(24)
+        env["SALLYPORT_DOMAIN"] = c["domain"]
+        env["SALLYPORT_MODE"] = "dev"
+    else:
+        env["IDP_CLIENT_SECRET"] = c["client_secret"]
+        env["SALLYPORT_MODE"] = "production"
+        env.pop("SALLYPORT_DOMAIN", None)
     lines = ["# Generated by ./sallyport init. Contains secrets; do not commit.\n"]
     lines += [f"{k}='{v}'\n" for k, v in sorted(env.items())]
     write_private(ENV_FILE, "".join(lines))
 
     GEN.mkdir(exist_ok=True)
     (GEN / "pomerium.yaml").write_text(render_pomerium(c))
+
+    if c["mode"] == "dev":
+        init_dev(c, env)
 
     initdb = GEN / "initdb"
     initdb.mkdir(exist_ok=True)
@@ -234,6 +332,16 @@ def cmd_init(args):
     shutil.copy(ROOT / "sql" / "003-app-role.sh", initdb / "003-app-role.sh")
     os.chmod(initdb / "003-app-role.sh", 0o755)
 
+    if c["mode"] == "dev":
+        d = c["domain"]
+        print("wrote .env, generated/pomerium.yaml, generated/dex.yaml, generated/certs/ and generated/initdb/")
+        print(f"\nDEV MODE: throwaway login, untrusted certificate, loopback only.\n\n"
+              "Next:\n  1. docker compose -f compose.yaml -f compose.dev.yaml up -d\n"
+              "  2. load-targets (loads the test SSH target)\n"
+              f"  3. open https://{d} and accept the certificate warning (or trust generated/certs/ca.crt);\n"
+              f"     first open https://dex.{d}:5556 once and accept its warning too if the login redirect fails.\n"
+              "  Sign-in is automatic as kilgore@kilgore.kilgore (Dex's mock connector).")
+        return
     print(f"wrote {ENV_FILE.name} (new secrets: {', '.join(new) or 'none, existing kept'})")
     print("wrote generated/pomerium.yaml and generated/initdb/")
     print(f"\nNext:\n  1. DNS: {c['domain']} and authenticate.{c['domain']} -> this server\n"
@@ -441,6 +549,9 @@ def cmd_check(args):
         c = validate_config(load_yaml(CONFIG))
         base = f"https://{c['domain']}"
         host = c["domain"]
+        if c["mode"] == "dev":
+            args.insecure = True
+            args.skip_ports = True
     context = ssl.create_default_context()
     if args.insecure:
         context.check_hostname = False

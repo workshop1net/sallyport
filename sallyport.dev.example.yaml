@@ -1,0 +1,7 @@
+# Dev mode: run the whole stack locally with no Let's Encrypt and no real IdP.
+# Copy to sallyport.yaml. LOCAL TESTING ONLY: see README, "Dev mode".
+mode: dev
+domain: access.localhost   # must end in .localhost
+session:
+  lifetime: 8h
+  idle_timeout: 30m

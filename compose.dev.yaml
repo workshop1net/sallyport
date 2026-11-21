@@ -1,0 +1,48 @@
+# Dev-mode overlay: replaces Let's Encrypt and the external IdP with a private CA
+# and a Dex mock login, and adds a throwaway SSH target. LOCAL TESTING ONLY.
+#
+#   docker compose -f compose.yaml -f compose.dev.yaml up -d
+#
+# Requires "mode: dev" in sallyport.yaml and ./sallyport init (see README).
+# Compose 2.24 or later is needed for the !override tag.
+
+services:
+  pomerium:
+    ports: !override
+      - "127.0.0.1:443:443"
+    volumes:
+      - ./generated/certs:/pomerium/certs:ro
+    networks:
+      internal:
+        # Pomerium (and Dex's callers) must resolve these names inside the stack.
+        aliases:
+          - ${SALLYPORT_DOMAIN:?run ./sallyport init in dev mode first}
+          - authenticate.${SALLYPORT_DOMAIN}
+    depends_on:
+      - dex
+
+  dex:
+    image: ghcr.io/dexidp/dex:latest
+    restart: unless-stopped
+    command: ["dex", "serve", "/etc/dex/config.yaml"]
+    volumes:
+      - ./generated/dex.yaml:/etc/dex/config.yaml:ro
+      - ./generated/certs:/certs:ro
+    ports:
+      - "127.0.0.1:5556:5556" # the browser is redirected here to "log in"
+    networks:
+      internal:
+        aliases:
+          - dex.${SALLYPORT_DOMAIN:?run ./sallyport init in dev mode first}
+    security_opt:
+      - no-new-privileges:true
+
+  sshtest:
+    image: lscr.io/linuxserver/openssh-server:latest
+    restart: unless-stopped
+    environment:
+      PASSWORD_ACCESS: "true"
+      USER_NAME: test
+      USER_PASSWORD: test
+      SUDO_ACCESS: "false"
+    networks: [targets] # reachable by guacd only, as "sshtest" on port 2222
