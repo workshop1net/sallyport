@@ -31,6 +31,7 @@ services:
     ports:
       - "127.0.0.1:5556:5556" # the browser is redirected here to "log in"
     networks:
+      edge: {} # needed to publish the port: Docker cannot publish from an internal-only network
       internal:
         aliases:
           - dex.${SALLYPORT_DOMAIN:?run ./sallyport init in dev mode first}
