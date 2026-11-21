@@ -33,7 +33,7 @@ The engineer only ever receives pixels. Their device never speaks RDP or SSH to 
 ## Requirements
 
 - A Linux server with Docker and the Compose plugin. Roughly 2 vCPU, 4 GB RAM and 40 GB disk is a reasonable starting point for one concurrent session (an estimate, not a benchmark).
-- Python 3 with PyYAML (`apt install python3-yaml`) for the helper script.
+- For the helper script: Python 3 with PyYAML (`apt install python3-yaml`), or on Windows, nothing extra (see below).
 - DNS names for `<domain>` and `authenticate.<domain>` pointing at the server, with ports 80 and 443 open to the internet (Let's Encrypt).
 - An OpenID Connect identity provider that can emit group IDs if you want group-based access.
 
@@ -53,6 +53,25 @@ docker compose up -d
 Register `https://authenticate.<domain>/oauth2/callback` as the redirect URI with your IdP. Start with `acme_staging: true`; once Pomerium obtains a staging certificate, set it to `false`, re-run `./sallyport init` and `docker compose up -d`.
 
 You never edit `compose.yaml`. Operators change only `sallyport.yaml` and `targets.yaml`.
+
+## Windows (Docker Desktop)
+
+The stack itself is plain Docker Compose, so it runs on Docker Desktop (WSL 2 backend). The helper script runs inside a container, so Python is not needed. Use `sallyport.cmd` wherever this README says `./sallyport`:
+
+```bat
+copy sallyport.example.yaml sallyport.yaml
+copy targets.example.yaml targets.yaml
+sallyport.cmd init
+docker compose up -d
+sallyport.cmd load-targets
+```
+
+Notes:
+- `load-targets` needs the stack running, because it connects to the database over the stack's internal network.
+- `sallyport.cmd check` runs in a container on the same machine, so it proves little. Use `sallyport.cmd check --url https://<domain>` from a different network, or run it from another machine.
+- Ports 80 and 443 must be forwarded to the Windows host and allowed through its firewall for Let's Encrypt. A desktop or laptop that sleeps is a poor gateway; use an always-on machine.
+- Windows file permissions do not protect `.env`, `sallyport.yaml` or `targets.yaml` the way mode 0600 does on Linux. Keep them in a folder only administrators can read.
+- Untested on Windows. Please report anything that breaks.
 
 ## What you configure
 
@@ -107,6 +126,8 @@ docker compose -f compose.yaml -f compose.hardening.yaml up -d
 compose.yaml              the stack (do not edit per deployment)
 compose.hardening.yaml    optional hardening overlay (untested)
 sallyport                 helper: init, load-targets, check
+sallyport.cmd             Windows wrapper: runs the helper in a container
+tools/                    Dockerfile for that container
 sallyport.example.yaml    operator config template
 targets.example.yaml      target list template
 sql/                      database setup scripts copied into generated/initdb

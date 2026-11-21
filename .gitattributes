@@ -1,0 +1,7 @@
+# Keep scripts LF on Windows checkouts: CRLF breaks them inside Linux containers.
+* text=auto
+sallyport text eol=lf
+*.sh text eol=lf
+*.sql text eol=lf
+*.yaml text eol=lf
+*.cmd text eol=crlf
