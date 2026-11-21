@@ -328,7 +328,96 @@ def validate_text(name, text):
             core.target_params(t)
         return True, f"valid ({len(targets)} target(s))"
     except SystemExit as e:
-        return False, str(e.code)
+        return False, re.sub(r"^error: ", "", str(e.code))
+
+
+# ------------------------------------------------------ structured config and targets
+
+class YamlDumper(yaml.SafeDumper):
+    pass
+
+
+def _represent_str(dumper, data):
+    style = "|" if "\n" in data else None  # keep multi-line keys readable
+    return dumper.represent_scalar("tag:yaml.org,2002:str", data, style=style)
+
+
+YamlDumper.add_representer(str, _represent_str)
+
+
+def dump_yaml(obj, header):
+    return header + yaml.dump(obj, Dumper=YamlDumper, sort_keys=False, default_flow_style=False, allow_unicode=True)
+
+
+def as_list(value):
+    if isinstance(value, str):
+        value = re.split(r"[\r\n]+", value)
+    return [str(v).strip() for v in (value or []) if str(v).strip()]
+
+
+def build_config_yaml(d):
+    mode = d.get("mode") or "production"
+    out = {"mode": mode, "domain": str(d.get("domain") or "").strip()}
+    session = {"lifetime": str(d.get("lifetime") or "8h").strip(), "idle_timeout": str(d.get("idle_timeout") or "30m").strip()}
+    if mode != "dev":
+        out["acme_email"] = str(d.get("acme_email") or "").strip()
+        out["acme_staging"] = bool(d.get("acme_staging"))
+        out["idp"] = {"issuer": str(d.get("issuer") or "").strip(), "client_id": str(d.get("client_id") or "").strip(),
+                      "client_secret": str(d.get("client_secret") or ""), "scopes": as_list(d.get("scopes")) or ["openid", "profile", "email"]}
+        out["access"] = {"emails": as_list(d.get("emails")), "groups": as_list(d.get("groups")),
+                         "groups_claim": str(d.get("groups_claim") or "groups").strip()}
+    out["session"] = session
+    return dump_yaml(out, "# Written by the Sallyport GUI. Comments added by hand are not kept when it saves.\n")
+
+
+def flatten_config(data):
+    idp, access, session = data.get("idp") or {}, data.get("access") or {}, data.get("session") or {}
+    return {"mode": data.get("mode", "production"), "domain": data.get("domain", ""),
+            "acme_email": data.get("acme_email", ""), "acme_staging": data.get("acme_staging", True),
+            "issuer": idp.get("issuer", ""), "client_id": idp.get("client_id", ""),
+            "client_secret": idp.get("client_secret", ""), "scopes": idp.get("scopes") or ["openid", "profile", "email"],
+            "emails": access.get("emails") or [], "groups": access.get("groups") or [],
+            "groups_claim": access.get("groups_claim", "groups"),
+            "lifetime": session.get("lifetime", "8h"), "idle_timeout": session.get("idle_timeout", "30m")}
+
+
+def read_structured(state, name):
+    path = state.folder / name
+    if not path.exists():
+        return {"exists": False, "data": None, "status": None}
+    text = path.read_text(encoding="utf-8")
+    try:
+        data = yaml.safe_load(text)
+    except yaml.YAMLError as e:
+        return {"exists": True, "data": None, "status": f"not valid YAML: {e}"}
+    if not isinstance(data, dict):
+        return {"exists": True, "data": None, "status": "must contain a YAML mapping"}
+    ok, msg = validate_text(name, text)
+    if name == "sallyport.yaml":
+        return {"exists": True, "data": flatten_config(data), "status": msg}
+    return {"exists": True, "data": data.get("targets") if isinstance(data.get("targets"), list) else [],
+            "status": msg}
+
+
+INT_FIELDS = ("port", "max_sessions")
+
+
+def build_targets_yaml(items):
+    cleaned = []
+    for t in items if isinstance(items, list) else []:
+        if not isinstance(t, dict):
+            continue
+        row = {}
+        for k, v in t.items():
+            if v is None or v == "":
+                continue
+            if k in INT_FIELDS and isinstance(v, str) and v.strip().isdigit():
+                v = int(v.strip())
+            row[str(k)] = v
+        cleaned.append(row)
+    header = ("# Written by the Sallyport GUI. Contains credentials in plain text.\n"
+              "# Comments added by hand are not kept when the GUI saves.\n")
+    return dump_yaml({"targets": cleaned}, header)
 
 
 # ----------------------------------------------------------------------- server
@@ -387,6 +476,8 @@ class Handler(BaseHTTPRequestHandler):
             job = self.state.job
             since = int((q.get("since") or ["0"])[0] or 0)
             return self.reply(200, job.snapshot(since) if job else {"title": "", "lines": [], "next": 0, "done": True, "ok": None})
+        if url.path in ("/api/config", "/api/targets"):
+            return self.reply(200, read_structured(self.state, "sallyport.yaml" if url.path == "/api/config" else "targets.yaml"))
         if url.path == "/api/file":
             name = (q.get("name") or [""])[0]
             if name not in EDITABLE:
@@ -442,6 +533,22 @@ class Handler(BaseHTTPRequestHandler):
                     return self.deny(400, "folder does not exist yet; clone first or create it")
                 core.write_private(self.state.folder / name, text.replace("\r\n", "\n"))
                 return self.reply(200, {"ok": ok, "message": ("saved; " + msg) if ok else ("saved anyway; " + msg), "saved": True})
+            return self.reply(200, {"ok": ok, "message": msg})
+        if path in ("/api/config/validate", "/api/config/save", "/api/targets/validate", "/api/targets/save"):
+            is_cfg = path.startswith("/api/config")
+            name = "sallyport.yaml" if is_cfg else "targets.yaml"
+            payload = body.get("data") if is_cfg else body.get("targets")
+            if (is_cfg and not isinstance(payload, dict)) or (not is_cfg and not isinstance(payload, list)):
+                return self.deny(400, "bad request")
+            text = build_config_yaml(payload) if is_cfg else build_targets_yaml(payload)
+            ok, msg = validate_text(name, text)
+            if path.endswith("/save"):
+                if not ok:
+                    return self.reply(200, {"ok": False, "message": msg, "saved": False})
+                if not self.state.folder.exists():
+                    return self.deny(400, "folder does not exist yet; clone first or create it")
+                core.write_private(self.state.folder / name, text)
+                return self.reply(200, {"ok": True, "message": "saved; " + msg, "saved": True})
             return self.reply(200, {"ok": ok, "message": msg})
         if path == "/api/quit":
             self.reply(200, {"ok": True})
@@ -511,6 +618,16 @@ pre{background:#0002;border:1px solid var(--bd);border-radius:6px;padding:8px;he
 .chk{display:grid;grid-template-columns:20px 130px 1fr;gap:2px 8px}
 .ok{color:var(--ok)} .bad{color:var(--bad)} .msg.bad{margin-left:6px} .msg.ok{margin-left:6px}
 .tabs button.on{font-weight:700;text-decoration:underline}
+.grid{display:grid;grid-template-columns:170px 1fr;gap:6px 10px;align-items:center;margin:6px 0}
+.grid>label{opacity:.85}.grid input[type=text],.grid input[type=password],.grid select,.grid textarea{width:100%;box-sizing:border-box;padding:6px 8px;font:inherit}
+.grid input[type=password]{flex:1}
+textarea.small{height:70px;font:12.5px/1.4 Consolas,monospace}
+.targets{display:grid;grid-template-columns:230px 1fr;gap:14px}
+.tlist{border:1px solid var(--bd);border-radius:6px;min-height:120px;max-height:320px;overflow:auto}
+.tlist div{padding:6px 8px;cursor:pointer;border-bottom:1px solid var(--bd)}.tlist div.on{background:#4a90d933;font-weight:600}
+.tlist small{opacity:.7;display:block}
+.hide{display:none!important}
+details summary{cursor:pointer;margin-bottom:8px}
 .warn{background:#f9a82522;border:1px solid #f9a82588;border-radius:6px;padding:6px 10px;margin:8px 0}
 </style></head><body>
 <h1>Sallyport</h1><div class="sub">Local control panel &mdash; listening on 127.0.0.1 only. <button id="quit">Quit</button></div>
@@ -523,15 +640,64 @@ pre{background:#0002;border:1px solid var(--bd);border-radius:6px;padding:8px;he
 <div class="row"><label for="repo">Repository</label><input type="text" id="repo"></div>
 <div class="row"><button id="clone" class="p">Clone / update</button><span class="sub">clones into the folder if it is empty or new, otherwise runs <code>git pull</code></span></div></section>
 
-<section><h2>3. Configuration</h2>
+<section><h2>3. Settings</h2>
+<div class="sub" id="cstatus"></div>
+<div class="grid">
+<label for="c_mode">Mode</label><select id="c_mode"><option value="production">Production (Let's Encrypt + your IdP)</option><option value="dev">Dev (local test: private certificate, mock login)</option></select>
+<label for="c_domain">Domain</label><input type="text" id="c_domain" placeholder="access.client.example (dev: access.localhost)">
+</div>
+<div id="prodFields"><div class="grid">
+<label for="c_acme_email">ACME email</label><input type="text" id="c_acme_email" placeholder="ops@msp.example">
+<label for="c_staging">Let's Encrypt staging</label><span><input type="checkbox" id="c_staging"> <label for="c_staging" class="sub">untrusted test certificates; untick for real ones</label></span>
+<label for="c_issuer">IdP issuer URL</label><input type="text" id="c_issuer" placeholder="https://accounts.google.com">
+<label for="c_client_id">Client ID</label><input type="text" id="c_client_id">
+<label for="c_secret">Client secret</label><span class="row"><input type="password" id="c_secret" autocomplete="off"><button type="button" id="c_show">Show</button></span>
+<label for="c_scopes">Scopes</label><input type="text" id="c_scopes" placeholder="openid profile email">
+<label for="c_emails">Allowed emails</label><textarea id="c_emails" class="small" placeholder="one per line"></textarea>
+<label for="c_groups">Allowed groups</label><textarea id="c_groups" class="small" placeholder="one group ID per line (optional)"></textarea>
+<label for="c_claim">Groups claim</label><input type="text" id="c_claim" placeholder="groups">
+</div>
+<div class="sub">Redirect URI to register with your IdP: <code id="redir"></code></div></div>
+<div id="devNote" class="sub" style="display:none">Dev mode signs you in as <code>kilgore@kilgore.trout</code> with a throwaway login. Domain must end in <code>.localhost</code>.</div>
+<div class="grid">
+<label for="c_life">Session lifetime</label><input type="text" id="c_life" placeholder="8h">
+<label for="c_idle">Idle timeout</label><input type="text" id="c_idle" placeholder="30m">
+</div>
+<div class="row"><button id="c_validate">Validate</button><button id="c_save" class="p">Save settings</button><span id="cmsg" class="msg"></span></div>
+<div class="warn">The client secret is stored in plain text in sallyport.yaml. After changing settings, run Initialise, then Restart.</div></section>
+
+<section><h2>4. Targets</h2>
+<div class="sub" id="tstatus"></div>
+<div class="targets">
+<div><div id="tlist" class="tlist"></div>
+<div class="row"><button id="t_add">Add</button><button id="t_dup">Duplicate</button><button id="t_del">Delete</button></div></div>
+<div id="tform" class="grid">
+<label for="t_name">Name</label><input type="text" id="t_name">
+<label for="t_protocol">Protocol</label><select id="t_protocol"><option>rdp</option><option>ssh</option><option>vnc</option></select>
+<label for="t_host">Host</label><input type="text" id="t_host" placeholder="10.0.0.10 or server.corp">
+<label for="t_port">Port</label><input type="text" id="t_port" placeholder="default for the protocol">
+<label for="t_username">Username</label><input type="text" id="t_username" autocomplete="off">
+<label for="t_password">Password</label><span class="row"><input type="password" id="t_password" autocomplete="off"><button type="button" id="t_show">Show</button></span>
+<label class="rdp" for="t_domain">Windows domain</label><input class="rdp" type="text" id="t_domain" placeholder="optional">
+<label class="rdp" for="t_security">RDP security</label><select class="rdp" id="t_security"><option>nla</option><option>tls</option><option>rdp</option><option>any</option></select>
+<label class="rdp" for="t_ignore_cert">Skip certificate check</label><span class="rdp"><input type="checkbox" id="t_ignore_cert"> <span class="sub">allows interception between guacd and the target</span></span>
+<label class="ssh" for="t_private_key">Private key</label><textarea class="ssh small" id="t_private_key" spellcheck="false" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"></textarea>
+<label class="ssh" for="t_passphrase">Key passphrase</label><input class="ssh" type="password" id="t_passphrase" autocomplete="off">
+<label class="ssh" for="t_host_key">Host key</label><input class="ssh" type="text" id="t_host_key" placeholder="ssh-ed25519 AAAA... (strongly recommended)">
+<label for="t_clipboard">Clipboard</label><select id="t_clipboard"><option value="both">both ways</option><option value="none">none</option><option value="paste-only">paste only (you to target)</option><option value="copy-only">copy only (target to you)</option></select>
+<label for="t_max_sessions">Max sessions</label><input type="text" id="t_max_sessions" placeholder="1">
+</div></div>
+<div class="row"><button id="t_validate">Validate</button><button id="t_save" class="p">Save targets</button><span id="tmsg" class="msg"></span></div>
+<div class="warn">Credentials are stored in plain text in targets.yaml and in the database. Use dedicated, least-privilege service accounts. File transfer and printing are always off. After saving, run Load targets.</div></section>
+
+<section><details><summary><b>Advanced: edit the raw YAML files</b></summary>
 <div class="tabs row"><button data-f="sallyport.yaml" class="on">sallyport.yaml</button><button data-f="targets.yaml">targets.yaml</button><span id="fstate" class="sub"></span></div>
 <textarea id="editor" spellcheck="false"></textarea>
-<div class="row"><button id="validate">Validate</button><button id="save" class="p">Save</button><span id="fmsg" class="msg"></span></div>
-<div class="warn">These files hold secrets (IdP client secret, target passwords) in plain text. Keep the folder readable only by administrators.</div></section>
+<div class="row"><button id="validate">Validate</button><button id="save">Save</button><span id="fmsg" class="msg"></span></div></details></section>
 
-<section><h2>4. Run</h2>
+<section><h2>5. Run</h2>
 <div class="row"><button data-a="init" class="p">Initialise</button><button data-a="up" class="p">Start</button><button data-a="restart">Restart (recreate)</button><button data-a="down">Stop</button><button data-a="load_targets" class="p">Load targets</button><button data-a="dry_run">Targets dry run</button><button data-a="check">Check service</button><button data-a="ps">Status</button><button data-a="logs">Logs</button></div>
-<div class="sub">Order for a new install: Clone, edit and save both files, Initialise, Start, Load targets. Re-run Initialise after changing sallyport.yaml, then Restart. Re-run Load targets after changing targets.yaml.</div>
+<div class="sub">Order for a new install: Clone, save settings and targets, Initialise, Start, Load targets. Re-run Initialise after changing sallyport.yaml, then Restart. Re-run Load targets after changing targets.yaml.</div>
 <h2>Output <span id="jtitle" class="sub"></span></h2><pre id="out"></pre></section>
 
 <script>
@@ -582,11 +748,11 @@ async function poll(){
     if(j.done){ if(j.ok===true)say("✔ done","ok"); else if(j.ok===false)say("✘ failed","bad"); break;}
     await new Promise(r=>setTimeout(r,700));
   }}catch(e){say("error: "+e.message,"bad")}
-  polling=false; refresh().catch(()=>{}); loadFile().catch(()=>{});
+  polling=false; refresh().catch(()=>{}); loadFile().catch(()=>{}); loadForms().catch(()=>{});
 }
 $("#clone").onclick=()=>run("clone",{repo:$("#repo").value});
 $$("button[data-a]").forEach(b=>b.onclick=()=>run(b.dataset.a));
-$("#recheck").onclick=async()=>{try{await folderSet();await refresh();await loadFile()}catch(e){say("error: "+e.message,"bad")}};
+$("#recheck").onclick=async()=>{try{await folderSet();await refresh();await loadFile();await loadForms()}catch(e){say("error: "+e.message,"bad")}};
 $$(".tabs button[data-f]").forEach(b=>b.onclick=async()=>{
   $$(".tabs button[data-f]").forEach(x=>x.classList.toggle("on",x===b)); cur=b.dataset.f;
   try{await folderSet();await loadFile()}catch(e){$("#fmsg").className="msg bad";$("#fmsg").textContent=e.message}});
@@ -600,13 +766,99 @@ async function fileAction(kind){
         const r2=await api("/api/save",{name:cur,text:$("#editor").value,force:true});
         m.className="msg bad"; m.textContent="✘ "+r2.message;}
     }
-    if(kind==="save"){refresh().catch(()=>{});$("#fstate").textContent=""}
+    if(kind==="save"){refresh().catch(()=>{});$("#fstate").textContent="";loadForms().catch(()=>{})}
   }catch(e){m.className="msg bad";m.textContent=e.message}
 }
 $("#validate").onclick=()=>fileAction("validate"); $("#save").onclick=()=>fileAction("save");
 $("#quit").onclick=async()=>{try{await api("/api/quit",{})}catch(e){} document.body.textContent="Stopped. You can close this tab."};
+
+/* ---- settings form ---- */
+const CF={mode:"c_mode",domain:"c_domain",acme_email:"c_acme_email",issuer:"c_issuer",client_id:"c_client_id",client_secret:"c_secret",groups_claim:"c_claim",lifetime:"c_life",idle_timeout:"c_idle"};
+const lines=v=>(v||"").split(/\r?\n/).map(x=>x.trim()).filter(Boolean);
+function cfgShow(){
+  const dev=$("#c_mode").value==="dev";
+  $("#prodFields").classList.toggle("hide",dev); $("#devNote").style.display=dev?"":"none";
+  $("#redir").textContent="https://authenticate."+($("#c_domain").value.trim()||"<domain>")+"/oauth2/callback";
+}
+function getCfg(){
+  const d={}; for(const k in CF)d[k]=$("#"+CF[k]).value;
+  d.acme_staging=$("#c_staging").checked;
+  d.scopes=($("#c_scopes").value.split(/[\s,]+/)).filter(Boolean);
+  d.emails=lines($("#c_emails").value); d.groups=lines($("#c_groups").value);
+  return d;
+}
+function setCfg(d){
+  d=d||{mode:"production",acme_staging:true,scopes:["openid","profile","email"],groups_claim:"groups",lifetime:"8h",idle_timeout:"30m"};
+  for(const k in CF)$("#"+CF[k]).value=d[k]??"";
+  $("#c_staging").checked=d.acme_staging!==false;
+  $("#c_scopes").value=(d.scopes||[]).join(" ");
+  $("#c_emails").value=(d.emails||[]).join("\n"); $("#c_groups").value=(d.groups||[]).join("\n");
+  cfgShow();
+}
+async function loadCfg(){
+  const r=await api("/api/config");
+  setCfg(r.data);
+  $("#cstatus").textContent=!r.exists?"No sallyport.yaml yet: showing defaults. Save creates it.":(r.data?"Current file: "+r.status:"The current file cannot be shown as a form ("+r.status+"). Fix it under Advanced.");
+}
+async function cfgAction(kind){
+  const m=$("#cmsg");
+  try{await folderSet(); const r=await api("/api/config/"+kind,{data:getCfg()});
+    m.className="msg "+(r.ok?"ok":"bad"); m.textContent=(r.ok?"✔ ":"✘ ")+r.message;
+    if(kind==="save"&&r.saved){await loadFile();refresh().catch(()=>{})}
+  }catch(e){m.className="msg bad";m.textContent=e.message}
+}
+$("#c_mode").onchange=cfgShow; $("#c_domain").oninput=cfgShow;
+$("#c_validate").onclick=()=>cfgAction("validate"); $("#c_save").onclick=()=>cfgAction("save");
+$("#c_show").onclick=()=>{const i=$("#c_secret");i.type=i.type==="password"?"text":"password";$("#c_show").textContent=i.type==="password"?"Show":"Hide"};
+
+/* ---- targets editor ---- */
+const TF=["name","protocol","host","port","username","password","domain","security","private_key","passphrase","host_key","clipboard","max_sessions"];
+const KEYS={common:["name","protocol","host","port","username","password","clipboard","max_sessions"],rdp:["domain","security","ignore_cert"],ssh:["private_key","passphrase","host_key"],vnc:[]};
+let targets=[], sel=-1;
+const blank=()=>({name:"",protocol:"rdp",host:"",security:"nla",ignore_cert:false,clipboard:"both",max_sessions:1});
+function tShowFields(){const p=$("#t_protocol").value;
+  $$(".rdp").forEach(e=>e.classList.toggle("hide",p!=="rdp")); $$(".ssh").forEach(e=>e.classList.toggle("hide",p!=="ssh"));}
+function tFill(){
+  const t=targets[sel]; $("#tform").classList.toggle("hide",!t); if(!t)return;
+  for(const k of TF)$("#t_"+k).value=t[k]??(k==="clipboard"?"both":(k==="security"?"nla":""));
+  $("#t_ignore_cert").checked=!!t.ignore_cert; tShowFields();
+}
+function tWrite(){
+  const t=targets[sel]; if(!t)return;
+  for(const k of TF)t[k]=$("#t_"+k).value; t.ignore_cert=$("#t_ignore_cert").checked; tShowFields(); tList();
+}
+function tList(){
+  const box=$("#tlist"); box.textContent="";
+  targets.forEach((t,i)=>{const d=document.createElement("div"); d.className=i===sel?"on":"";
+    d.textContent=t.name||"(unnamed)"; const s=document.createElement("small"); s.textContent=(t.protocol||"")+" "+(t.host||""); d.appendChild(s);
+    d.onclick=()=>{sel=i;tList();tFill()}; box.appendChild(d);});
+}
+function tSerialise(){
+  return targets.map(t=>{const o={},p=t.protocol||"rdp";
+    for(const k of KEYS.common.concat(KEYS[p]||[])){const v=t[k]; if(v===undefined||v===null||v==="")continue; o[k]=v;}
+    if(p==="rdp")o.ignore_cert=!!t.ignore_cert; return o;});
+}
+async function loadTargets(){
+  const r=await api("/api/targets"); targets=(r.data||[]).map(t=>Object.assign(blank(),t)); sel=targets.length?0:-1; tList(); tFill();
+  $("#tstatus").textContent=!r.exists?"No targets.yaml yet. Add a target and save.":"Current file: "+r.status;
+}
+async function tAction(kind){
+  const m=$("#tmsg");
+  try{await folderSet(); const r=await api("/api/targets/"+kind,{targets:tSerialise()});
+    m.className="msg "+(r.ok?"ok":"bad"); m.textContent=(r.ok?"✔ ":"✘ ")+r.message;
+    if(kind==="save"&&r.saved){await loadFile();$("#tstatus").textContent="Saved."}
+  }catch(e){m.className="msg bad";m.textContent=e.message}
+}
+$$("#tform input,#tform select,#tform textarea").forEach(e=>{e.oninput=tWrite;e.onchange=tWrite});
+$("#t_add").onclick=()=>{targets.push(blank());sel=targets.length-1;tList();tFill();$("#t_name").focus()};
+$("#t_dup").onclick=()=>{if(sel<0)return;const c=JSON.parse(JSON.stringify(targets[sel]));c.name=(c.name||"target")+"-copy";targets.push(c);sel=targets.length-1;tList();tFill()};
+$("#t_del").onclick=()=>{if(sel<0)return;if(!confirm("Delete target \""+(targets[sel].name||"unnamed")+"\"? (Not final until you press Save targets.)"))return;targets.splice(sel,1);sel=Math.min(sel,targets.length-1);tList();tFill()};
+$("#t_validate").onclick=()=>tAction("validate"); $("#t_save").onclick=()=>tAction("save");
+$("#t_show").onclick=()=>{const i=$("#t_password");i.type=i.type==="password"?"text":"password";$("#t_show").textContent=i.type==="password"?"Show":"Hide"};
+async function loadForms(){await loadCfg();await loadTargets()}
+
 setInterval(()=>api("/api/ping").catch(()=>{}),20000);
-refresh().then(loadFile).catch(e=>{document.body.textContent="Cannot reach the Sallyport GUI: "+e.message+" (was it closed? run it again)"});
+refresh().then(loadFile).then(loadForms).catch(e=>{document.body.textContent="Cannot reach the Sallyport GUI: "+e.message+" (was it closed? run it again)"});
 </script></body></html>
 """
 

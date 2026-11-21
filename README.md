@@ -76,11 +76,11 @@ Never use dev mode on a server or any machine others can reach. Needs Docker Com
 
 ## Control panel (GUI)
 
-`sallyport-gui.cmd` (Windows) or `python sallyport_gui.py` (anywhere with Python 3) opens a small control panel in your browser. It checks that Docker, Compose and Git are present, clones or updates the repository into a folder you choose, edits and validates `sallyport.yaml` and `targets.yaml`, and has buttons for Initialise, Start, Restart, Stop, Load targets, Check, Status and Logs. It uses the same code as the command line.
+`sallyport-gui.cmd` (Windows) or `python sallyport_gui.py` (anywhere with Python 3) opens a small control panel in your browser. It checks that Docker, Compose and Git are present, clones or updates the repository into a folder you choose, has forms for every setting in `sallyport.yaml` and an editor for the targets (with a raw-YAML view for anything else), validates before saving, and has buttons for Initialise, Start, Restart, Stop, Load targets, Check, Status and Logs. It uses the same code as the command line.
 
 Install once: Python 3.12 or later, Git, Docker Desktop, then `pip install -r requirements.txt` (the `.cmd` does this for you).
 
-It listens on 127.0.0.1 only, but any web page open in your browser can send requests to localhost, so every request needs a random token (in the URL it prints), an exact `Host` header and, for changes, a matching `Origin` and a JSON body. It stops when you close the tab or press Quit. Use it on the machine itself; do not forward its port. Untested on Windows and in a real browser.
+It listens on 127.0.0.1 only, but any web page open in your browser can send requests to localhost, so every request needs a random token (in the URL it prints), an exact `Host` header and, for changes, a matching `Origin` and a JSON body. It stops when you close the tab or press Quit. Use it on the machine itself; do not forward its port. Saving from the forms rewrites the YAML files, so hand-written comments in them are not kept. Untested on Windows.
 
 ## Windows (Docker Desktop)
 
