@@ -322,10 +322,13 @@ def init_dev(c, env):
     if not TARGETS.exists():
         write_text(
             TARGETS,
-            "# Dev mode test target: a throwaway SSH server container from compose.dev.yaml.\n"
+            "# Dev mode test targets: throwaway SSH and RDP containers from compose.dev.yaml.\n"
             "targets:\n  - name: sshtest\n    protocol: ssh\n    host: sshtest\n    port: 2222\n"
-            "    username: test\n    password: test\n")
-        print("wrote targets.yaml with a test SSH target")
+            "    username: test\n    password: test\n"
+            "  - name: rdptest\n    protocol: rdp\n    host: rdptest\n    port: 3389\n"
+            "    username: abc\n    password: abc\n    security: tls   # xrdp does not support NLA\n"
+            "    ignore_cert: true   # xrdp uses a self-signed certificate\n")
+        print("wrote targets.yaml with test SSH and RDP targets")
 
 
 def cmd_init(args):
