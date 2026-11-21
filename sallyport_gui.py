@@ -614,7 +614,7 @@ input[type=text]{flex:1;min-width:220px;padding:6px 8px;font:inherit}
 button{padding:6px 12px;font:inherit;cursor:pointer}
 button.p{font-weight:600}
 textarea{width:100%;box-sizing:border-box;height:260px;font:12.5px/1.4 Consolas,monospace;padding:8px;tab-size:2}
-pre{background:#0002;border:1px solid var(--bd);border-radius:6px;padding:8px;height:260px;overflow:auto;margin:0;white-space:pre-wrap;font:12.5px/1.4 Consolas,monospace}
+pre{background:#0002;border:1px solid var(--bd);border-radius:6px;padding:8px;height:170px;overflow:auto;margin:0;white-space:pre-wrap;font:12.5px/1.4 Consolas,monospace}
 .chk{display:grid;grid-template-columns:20px 130px 1fr;gap:2px 8px}
 .ok{color:var(--ok)} .bad{color:var(--bad)} .msg.bad{margin-left:6px} .msg.ok{margin-left:6px}
 .tabs button.on{font-weight:700;text-decoration:underline}
@@ -627,6 +627,8 @@ textarea.small{height:70px;font:12.5px/1.4 Consolas,monospace}
 .tlist div{padding:6px 8px;cursor:pointer;border-bottom:1px solid var(--bd)}.tlist div.on{background:#4a90d933;font-weight:600}
 .tlist small{opacity:.7;display:block}
 .hide{display:none!important}
+#outpanel{position:sticky;bottom:0;background:Canvas;color:CanvasText;border-top:2px solid var(--bd);padding:6px 0 8px;margin-top:10px}
+body{padding-bottom:0}
 details summary{cursor:pointer;margin-bottom:8px}
 .warn{background:#f9a82522;border:1px solid #f9a82588;border-radius:6px;padding:6px 10px;margin:8px 0}
 </style></head><body>
@@ -698,8 +700,10 @@ details summary{cursor:pointer;margin-bottom:8px}
 <section><h2>5. Run</h2>
 <div class="row"><button data-a="init" class="p">Initialise</button><button data-a="up" class="p">Start</button><button data-a="restart">Restart (recreate)</button><button data-a="down">Stop</button><button data-a="load_targets" class="p">Load targets</button><button data-a="dry_run">Targets dry run</button><button data-a="check">Check service</button><button data-a="ps">Status</button><button data-a="logs">Logs</button></div>
 <div class="sub">Order for a new install: Clone, save settings and targets, Initialise, Start, Load targets. Re-run Initialise after changing sallyport.yaml, then Restart. Re-run Load targets after changing targets.yaml.</div>
-<h2>Output <span id="jtitle" class="sub"></span></h2><pre id="out"></pre></section>
+</section>
 
+<div id="outpanel"><div class="row"><b>Output</b> <span id="jtitle" class="sub"></span> <span id="jstate" class="msg"></span>
+<button id="outclear" style="margin-left:auto">Clear</button></div><pre id="out">Nothing run yet. Output from Clone / update and the Run buttons appears here.</pre></div>
 <script>
 "use strict";
 const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
@@ -712,6 +716,7 @@ async function api(path,body){
   const r=await fetch(path,o); let j={}; try{j=await r.json()}catch(e){}
   if(!r.ok) throw new Error(j.error||("HTTP "+r.status)); return j;
 }
+function setState(t,cls){const e=$("#jstate");e.textContent=t;e.className="msg "+cls}
 function say(t,cls){const o=$("#out");const d=document.createElement("div");d.textContent=t;if(cls)d.className=cls;o.appendChild(d);o.scrollTop=o.scrollHeight}
 async function refresh(){
   const s=await api("/api/state");
@@ -735,7 +740,7 @@ async function folderSet(){
   await api("/api/folder",{folder:$("#folder").value,repo:$("#repo").value});
 }
 async function run(action,extra){
-  try{await folderSet(); $("#out").textContent=""; since=0;
+  try{await folderSet(); $("#out").textContent=""; since=0; setState("running\u2026","");
     await api("/api/run",Object.assign({action},extra||{})); poll();
   }catch(e){say("error: "+e.message,"bad")}
 }
@@ -745,11 +750,12 @@ async function poll(){
     const j=await api("/api/job?since="+since);
     $("#jtitle").textContent=j.title?"— "+j.title:"";
     j.lines.forEach(l=>say(l)); since=j.next;
-    if(j.done){ if(j.ok===true)say("✔ done","ok"); else if(j.ok===false)say("✘ failed","bad"); break;}
+    if(j.done){ if(j.ok===true){say("✔ done","ok");setState("✔ done","ok")} else if(j.ok===false){say("✘ failed","bad");setState("✘ failed","bad")} break;}
     await new Promise(r=>setTimeout(r,700));
   }}catch(e){say("error: "+e.message,"bad")}
   polling=false; refresh().catch(()=>{}); loadFile().catch(()=>{}); loadForms().catch(()=>{});
 }
+$("#outclear").onclick=()=>{$("#out").textContent="";setState("","")};
 $("#clone").onclick=()=>run("clone",{repo:$("#repo").value});
 $$("button[data-a]").forEach(b=>b.onclick=()=>run(b.dataset.a));
 $("#recheck").onclick=async()=>{try{await folderSet();await refresh();await loadFile();await loadForms()}catch(e){say("error: "+e.message,"bad")}};
