@@ -582,7 +582,8 @@ class Handler(BaseHTTPRequestHandler):
         if url.path == "/api/state":
             s = load_settings()
             return self.reply(200, {"folder": str(self.state.folder), "repo": s.get("repo", DEFAULT_REPO),
-                                    "checks": check_environment(self.state), "mode": stack_mode(self.state)})
+                                    "checks": check_environment(self.state), "mode": stack_mode(self.state),
+                                    "checkout": (self.state.folder / ".git").exists() and (self.state.folder / "compose.yaml").exists()})
         if url.path == "/api/update":
             return self.reply(200, update_status(self.state, force=(q.get("force") or ["0"])[0] == "1"))
         if url.path == "/api/job":
@@ -757,10 +758,10 @@ details summary{cursor:pointer;margin-bottom:8px}
 <div id="checks" class="chk">loading&hellip;</div>
 <div class="row"><button id="recheck">Check again</button></div></details></section>
 
-<section><h2>2. Folder and repository</h2>
+<section><details id="repod"><summary><b>2. Folder and repository</b> <span id="repsum" class="sub"></span></summary>
 <div class="row"><label for="folder">Folder</label><input type="text" id="folder"></div>
 <div class="row"><label for="repo">Repository</label><input type="text" id="repo"></div>
-<div class="row"><button id="clone" class="p">Clone / update</button><span class="sub">clones into the folder if it is empty or new, otherwise runs <code>git pull</code></span></div></section>
+<div class="row"><button id="clone" class="p">Clone / update</button><span class="sub">clones into the folder if it is empty or new, otherwise runs <code>git pull</code></span></div></details></section>
 
 <section><h2>3. Settings</h2>
 <div class="sub" id="cstatus"></div>
@@ -853,6 +854,10 @@ async function refresh(){
   $("#envsum").textContent=allOk?"— all passed ✔":"— problems found ✘";
   if(!allOk)$("#envd").open=true; else if(!window._envShown)$("#envd").open=false;
   window._envShown=true;
+  const rd=$("#repod");
+  $("#repsum").textContent=s.checkout?"\u2014 "+s.folder+" \u2714":"\u2014 set up the folder and clone the repository \u2718";
+  if(!s.checkout)rd.open=true; else if(!window._repShown)rd.open=false;
+  window._repShown=true;
 }
 function bannerBox(cls){const b=$("#banner");b.textContent="";const d=document.createElement("div");d.className="banner "+(cls||"");b.appendChild(d);return d}
 function li(ul,t){const l=document.createElement("li");l.textContent=t;ul.appendChild(l)}
