@@ -74,6 +74,14 @@ What dev mode swaps:
 
 Never use dev mode on a server or any machine others can reach. Needs Docker Compose 2.24 or later. Untested.
 
+## Control panel (GUI)
+
+`sallyport-gui.cmd` (Windows) or `python sallyport_gui.py` (anywhere with Python 3) opens a small control panel in your browser. It checks that Docker, Compose and Git are present, clones or updates the repository into a folder you choose, edits and validates `sallyport.yaml` and `targets.yaml`, and has buttons for Initialise, Start, Restart, Stop, Load targets, Check, Status and Logs. It uses the same code as the command line.
+
+Install once: Python 3.12 or later, Git, Docker Desktop, then `pip install -r requirements.txt` (the `.cmd` does this for you).
+
+It listens on 127.0.0.1 only, but any web page open in your browser can send requests to localhost, so every request needs a random token (in the URL it prints), an exact `Host` header and, for changes, a matching `Origin` and a JSON body. It stops when you close the tab or press Quit. Use it on the machine itself; do not forward its port. Untested on Windows and in a real browser.
+
 ## Windows (Docker Desktop)
 
 The stack itself is plain Docker Compose, so it runs on Docker Desktop (WSL 2 backend). The helper script runs inside a container, so Python is not needed. Use `sallyport.cmd` wherever this README says `./sallyport`:
@@ -148,7 +156,11 @@ compose.hardening.yaml    optional hardening overlay (untested)
 compose.dev.yaml          dev-mode overlay: Dex login, private CA, test SSH target
 sallyport.dev.example.yaml  dev-mode config template
 sallyport                 helper: init, load-targets, check
-sallyport.cmd             Windows wrapper: runs the helper in a container
+sallyport.cmd             Windows wrapper: runs the helper in a container (no Python needed)
+sallyport_core.py         the logic behind the command line and the GUI
+sallyport_gui.py          loopback web control panel
+sallyport-gui.cmd         launches the control panel on Windows
+requirements.txt          Python packages (pyyaml, cryptography)
 tools/                    Dockerfile for that container
 sallyport.example.yaml    operator config template
 targets.example.yaml      target list template
