@@ -53,7 +53,10 @@ DEFAULT_GROUP = "sallyport-users"
 
 DOMAIN_RE = re.compile(r"^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
 DURATION_RE = re.compile(r"^[1-9][0-9]*[smh]$")
-CLAIM_RE = re.compile(r"^[A-Za-z0-9_:.-]{1,64}$")
+CLAIM_RE = re.compile(r"^[A-Za-z0-9_:./-]{1,64}$")
+AUTH0_DOMAIN_RE = re.compile(r"^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?\.[a-z]{2,63}$")
+PROVIDERS = ("oidc", "auth0", "google")
+AUTH0_GROUPS_CLAIM = "pomerium.io/groups"  # the claim name Pomerium's Auth0 guide uses
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}$")
 HOST_RE = re.compile(r"^[A-Za-z0-9._:-]{1,253}$")
 
@@ -139,12 +142,36 @@ def validate_config(cfg):
     idp = cfg["idp"]
     if not isinstance(idp, dict):
         die("idp must be a mapping")
-    check_keys("idp", idp, {"issuer", "client_id", "client_secret", "scopes"},
-               required=("issuer", "client_id", "client_secret"))
-    for key in ("issuer", "client_id", "client_secret"):
+    check_keys("idp", idp, {"provider", "issuer", "domain", "client_id", "client_secret", "scopes"},
+               required=("client_id", "client_secret"))
+    provider = idp.get("provider", "oidc")
+    if provider not in PROVIDERS:
+        die(f"idp.provider must be one of {list(PROVIDERS)}")
+    issuer = ""
+    if provider == "oidc":
+        check_keys("idp", {k: v for k, v in idp.items() if k != "domain"}, {"provider", "issuer", "client_id", "client_secret", "scopes"},
+                   required=("issuer",))
+        if "domain" in idp:
+            die("idp.domain only applies to the auth0 provider")
+        issuer = nonempty_str("idp", "issuer", idp["issuer"])
+        if not issuer.startswith("https://"):
+            die("idp.issuer must be an https:// URL")
+    elif provider == "auth0":
+        if "domain" not in idp:
+            die("idp: 'domain' is required for auth0 (your tenant domain, for example example.eu.auth0.com)")
+        domain_in = nonempty_str("idp", "domain", idp["domain"], 253).strip().lower()
+        domain_in = re.sub(r"^https://", "", domain_in).rstrip("/")
+        if not AUTH0_DOMAIN_RE.match(domain_in):
+            die("idp.domain must be a hostname such as example.eu.auth0.com")
+        if "issuer" in idp:
+            die("idp.issuer does not apply to auth0; set idp.domain")
+        issuer = "https://" + domain_in
+    else:  # google
+        for k in ("issuer", "domain"):
+            if k in idp:
+                die(f"idp.{k} does not apply to google")
+    for key in ("client_id", "client_secret"):
         nonempty_str("idp", key, idp[key])
-    if not idp["issuer"].startswith("https://"):
-        die("idp.issuer must be an https:// URL")
     if idp["client_secret"] == "change-me":
         die("idp.client_secret is still the example value")
     scopes = idp.get("scopes", ["openid", "profile", "email"])
@@ -169,15 +196,17 @@ def validate_config(cfg):
         nonempty_str("access.groups", "entry", g, 256)
     if not emails and not groups:
         die("access must list at least one email or group, or nobody could log in")
-    claim = access.get("groups_claim", "groups")
+    claim = access.get("groups_claim", AUTH0_GROUPS_CLAIM if provider == "auth0" else "groups")
     if not isinstance(claim, str) or not CLAIM_RE.match(claim):
         die("access.groups_claim is not a valid claim name")
+    if provider == "google" and groups:
+        die("Google does not provide group claims; list people under access.emails instead")
 
     lifetime, idle = parse_session(cfg)
 
     return {
         "mode": "production", "domain": domain, "acme_email": email, "staging": staging,
-        "issuer": idp["issuer"], "client_id": idp["client_id"], "client_secret": idp["client_secret"],
+        "provider": provider, "issuer": issuer, "client_id": idp["client_id"], "client_secret": idp["client_secret"],
         "scopes": scopes, "emails": [e.strip() for e in emails], "groups": groups,
         "groups_claim": claim, "lifetime": lifetime, "idle": idle,
     }
@@ -214,10 +243,14 @@ def render_pomerium(c):
     else:
         tls = {"autocert": True, "autocert_email": c["acme_email"], "autocert_use_staging": c["staging"]}
         idp = {"idp_provider_url": c["issuer"], "idp_client_id": c["client_id"], "idp_scopes": c["scopes"]}
+        if c["provider"] == "google":
+            idp = {"idp_client_id": c["client_id"]}          # Pomerium's Google provider has its own defaults
+        elif c["provider"] == "auth0":
+            idp = {"idp_provider_url": c["issuer"], "idp_client_id": c["client_id"]}
     config = {
         **tls,
         "authenticate_service_url": f"https://authenticate.{c['domain']}",
-        "idp_provider": "oidc",
+        "idp_provider": "oidc" if dev else c["provider"],
         **idp,
         "cookie_expire": c["lifetime"],
         "jwt_claims_headers": {"X-Pomerium-Claim-Email": "email"},

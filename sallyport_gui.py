@@ -521,10 +521,21 @@ def build_config_yaml(d):
     if mode != "dev":
         out["acme_email"] = str(d.get("acme_email") or "").strip()
         out["acme_staging"] = bool(d.get("acme_staging"))
-        out["idp"] = {"issuer": str(d.get("issuer") or "").strip(), "client_id": str(d.get("client_id") or "").strip(),
-                      "client_secret": str(d.get("client_secret") or ""), "scopes": as_list(d.get("scopes")) or ["openid", "profile", "email"]}
-        out["access"] = {"emails": as_list(d.get("emails")), "groups": as_list(d.get("groups")),
-                         "groups_claim": str(d.get("groups_claim") or "groups").strip()}
+        prov = d.get("provider") or "oidc"
+        idp = {"provider": prov}
+        if prov == "oidc":
+            idp["issuer"] = str(d.get("issuer") or "").strip()
+        elif prov == "auth0":
+            idp["domain"] = str(d.get("idp_domain") or "").strip()
+        idp["client_id"] = str(d.get("client_id") or "").strip()
+        idp["client_secret"] = str(d.get("client_secret") or "")
+        if prov == "oidc":
+            idp["scopes"] = as_list(d.get("scopes")) or ["openid", "profile", "email"]
+        out["idp"] = idp
+        access = {"emails": as_list(d.get("emails")), "groups": [] if prov == "google" else as_list(d.get("groups"))}
+        if str(d.get("groups_claim") or "").strip():
+            access["groups_claim"] = str(d["groups_claim"]).strip()
+        out["access"] = access
     out["session"] = session
     return dump_yaml(out, "# Written by the Sallyport GUI. Comments added by hand are not kept when it saves.\n")
 
@@ -533,10 +544,11 @@ def flatten_config(data):
     idp, access, session = data.get("idp") or {}, data.get("access") or {}, data.get("session") or {}
     return {"mode": data.get("mode", "production"), "domain": data.get("domain", ""),
             "acme_email": data.get("acme_email", ""), "acme_staging": data.get("acme_staging", True),
-            "issuer": idp.get("issuer", ""), "client_id": idp.get("client_id", ""),
+            "provider": idp.get("provider", "oidc"), "issuer": idp.get("issuer", ""), "idp_domain": idp.get("domain", ""),
+            "client_id": idp.get("client_id", ""),
             "client_secret": idp.get("client_secret", ""), "scopes": idp.get("scopes") or ["openid", "profile", "email"],
             "emails": access.get("emails") or [], "groups": access.get("groups") or [],
-            "groups_claim": access.get("groups_claim", "groups"),
+            "groups_claim": access.get("groups_claim", ""),
             "lifetime": session.get("lifetime", "8h"), "idle_timeout": session.get("idle_timeout", "30m")}
 
 
@@ -830,15 +842,19 @@ details summary{cursor:pointer;margin-bottom:8px}
 <div id="prodFields"><div class="grid">
 <label for="c_acme_email">ACME email</label><input type="text" id="c_acme_email" placeholder="ops@msp.example">
 <label for="c_staging">Let's Encrypt staging</label><span><input type="checkbox" id="c_staging"> <label for="c_staging" class="sub">untrusted test certificates; untick for real ones</label></span>
-<label for="c_issuer">IdP issuer URL</label><input type="text" id="c_issuer" placeholder="https://accounts.google.com">
+<label for="c_provider">Identity provider</label><select id="c_provider"><option value="oidc">Generic OpenID Connect</option><option value="auth0">Auth0</option><option value="google">Google</option></select>
+<label class="p_oidc" for="c_issuer">Issuer URL</label><input class="p_oidc" type="text" id="c_issuer" placeholder="https://login.example.com/tenant/v2.0">
+<label class="p_auth0" for="c_idp_domain">Auth0 tenant domain</label><input class="p_auth0" type="text" id="c_idp_domain" placeholder="example.eu.auth0.com">
 <label for="c_client_id">Client ID</label><input type="text" id="c_client_id">
 <label for="c_secret">Client secret</label><span class="row"><input type="password" id="c_secret" autocomplete="off"><button type="button" id="c_show">Show</button></span>
-<label for="c_scopes">Scopes</label><input type="text" id="c_scopes" placeholder="openid profile email">
+<label class="p_oidc" for="c_scopes">Scopes</label><input class="p_oidc" type="text" id="c_scopes" placeholder="openid profile email">
 <label for="c_emails">Allowed emails</label><textarea id="c_emails" class="small" placeholder="one per line"></textarea>
-<label for="c_groups">Allowed groups</label><textarea id="c_groups" class="small" placeholder="one group ID per line (optional)"></textarea>
-<label for="c_claim">Groups claim</label><input type="text" id="c_claim" placeholder="groups">
+<label class="p_groups" for="c_groups">Allowed groups</label><textarea id="c_groups" class="small p_groups" placeholder="one group ID per line (optional)"></textarea>
+<label class="p_groups" for="c_claim">Groups claim</label><input class="p_groups" type="text" id="c_claim" placeholder="groups">
 </div>
-<div class="sub">Redirect URI to register with your IdP: <code id="redir"></code></div></div>
+<details id="idpHelp" open><summary><b>How to set this up with your identity provider</b></summary><div id="helpBody" class="sub"></div>
+<div id="actionBox" class="hide"><div class="sub">Auth0 login Action for groups (Actions &rarr; Library &rarr; Create Action &rarr; Login / Post Login; deploy it, then add it to the Login flow):</div>
+<textarea id="actionCode" class="small" readonly spellcheck="false"></textarea><div class="row"><button type="button" id="actionCopy">Copy</button></div></div></details></div>
 <div id="devNote" class="sub" style="display:none">Dev mode signs you in as <code>kilgore@kilgore.trout</code> with a throwaway login. Domain must end in <code>.localhost</code>.</div>
 <div class="grid">
 <label for="c_life">Session lifetime</label><input type="text" id="c_life" placeholder="8h">
@@ -1017,12 +1033,39 @@ $("#validate").onclick=()=>fileAction("validate"); $("#save").onclick=()=>fileAc
 $("#quit").onclick=async()=>{try{await api("/api/quit",{})}catch(e){} document.body.textContent="Stopped. You can close this tab."};
 
 /* ---- settings form ---- */
-const CF={mode:"c_mode",domain:"c_domain",acme_email:"c_acme_email",issuer:"c_issuer",client_id:"c_client_id",client_secret:"c_secret",groups_claim:"c_claim",lifetime:"c_life",idle_timeout:"c_idle"};
+const CF={mode:"c_mode",domain:"c_domain",acme_email:"c_acme_email",provider:"c_provider",issuer:"c_issuer",idp_domain:"c_idp_domain",client_id:"c_client_id",client_secret:"c_secret",groups_claim:"c_claim",lifetime:"c_life",idle_timeout:"c_idle"};
 const lines=v=>(v||"").split(/\r?\n/).map(x=>x.trim()).filter(Boolean);
+const ACTION_CODE="exports.onExecutePostLogin = async (event, api) => {\n  if (event.authorization) {\n    api.idToken.setCustomClaim('pomerium.io/groups', event.authorization.roles);\n  }\n};\n";
+function helpList(items){const ol=document.createElement("ol");items.forEach(t=>{const l=document.createElement("li");l.textContent=t;ol.appendChild(l)});return ol}
 function cfgShow(){
-  const dev=$("#c_mode").value==="dev";
+  const dev=$("#c_mode").value==="dev", prov=$("#c_provider").value;
   $("#prodFields").classList.toggle("hide",dev); $("#devNote").style.display=dev?"":"none";
-  $("#redir").textContent="https://authenticate."+($("#c_domain").value.trim()||"<domain>")+"/oauth2/callback";
+  $$(".p_oidc").forEach(e=>e.classList.toggle("hide",prov!=="oidc"));
+  $$(".p_auth0").forEach(e=>e.classList.toggle("hide",prov!=="auth0"));
+  $$(".p_groups").forEach(e=>e.classList.toggle("hide",prov==="google"));
+  $("#c_claim").placeholder=prov==="auth0"?"pomerium.io/groups":"groups";
+  const d=$("#c_domain").value.trim()||"<domain>", auth="https://authenticate."+d;
+  const hb=$("#helpBody"); hb.textContent=""; $("#actionBox").classList.toggle("hide",prov!=="auth0");
+  if(prov==="auth0"){
+    hb.appendChild(helpList([
+      "In the Auth0 dashboard: Applications → Applications → Create Application. Pomerium's guide uses the Native type. Copy the Domain, Client ID and Client Secret into the fields above.",
+      "On the application's Settings tab set Application Login URI = "+auth+" ; Allowed Callback URLs = "+auth+"/oauth2/callback ; Allowed Logout URLs = "+auth+"/.pomerium/signed_out . Save.",
+      "Add each person under User Management → Users (or federate the MSP's own identity provider as an enterprise connection), then list their email addresses under Allowed emails.",
+      "Passkeys: enable them in your Auth0 tenant (see Auth0's documentation for the current steps; they are listed as included on the free plan).",
+      "Optional groups: create Roles in Auth0 and assign them to users, add the Action below, and list the role names under Allowed groups. The groups claim defaults to pomerium.io/groups.",
+      "If login fails with a client authentication error, try the Regular Web Application type instead."]));
+    $("#actionCode").value=ACTION_CODE;
+  }else if(prov==="google"){
+    hb.appendChild(helpList([
+      "Google Cloud Console → APIs & Services → OAuth consent screen: choose External and leave it in Testing, then add your people under Test users.",
+      "Credentials → Create credentials → OAuth client ID → Web application. Add "+auth+"/oauth2/callback as an authorised redirect URI.",
+      "Copy the Client ID and Client Secret into the fields above, and list the Google email addresses under Allowed emails. Google does not provide group claims."]));
+  }else{
+    hb.appendChild(helpList([
+      "Register this redirect URI with your identity provider: "+auth+"/oauth2/callback",
+      "Enter the provider's issuer URL, client ID and client secret above. The provider must publish OpenID Connect discovery.",
+      "For groups, the provider must put them in the ID token under the claim name given above."]));
+  }
 }
 function getCfg(){
   const d={}; for(const k in CF)d[k]=$("#"+CF[k]).value;
@@ -1032,7 +1075,7 @@ function getCfg(){
   return d;
 }
 function setCfg(d){
-  d=d||{mode:"production",acme_staging:true,scopes:["openid","profile","email"],groups_claim:"groups",lifetime:"8h",idle_timeout:"30m"};
+  d=d||{mode:"production",provider:"oidc",acme_staging:true,scopes:["openid","profile","email"],groups_claim:"",lifetime:"8h",idle_timeout:"30m"};
   for(const k in CF)$("#"+CF[k]).value=d[k]??"";
   $("#c_staging").checked=d.acme_staging!==false;
   $("#c_scopes").value=(d.scopes||[]).join(" ");
@@ -1051,8 +1094,9 @@ async function cfgAction(kind){
     if(kind==="save"&&r.saved){await loadFile();refresh().catch(()=>{});$("#c_apply").classList.remove("hide")}
   }catch(e){m.className="msg bad";m.textContent=e.message}
 }
-$$("#prodFields input,#prodFields textarea,#c_domain,#c_life,#c_idle,#c_mode").forEach(e=>e.addEventListener("input",()=>$("#c_apply").classList.add("hide")));
-$("#c_mode").onchange=cfgShow; $("#c_domain").oninput=cfgShow;
+$$("#prodFields input,#prodFields textarea,#prodFields select,#c_domain,#c_life,#c_idle,#c_mode").forEach(e=>e.addEventListener("input",()=>$("#c_apply").classList.add("hide")));
+$("#c_mode").onchange=cfgShow; $("#c_domain").oninput=cfgShow; $("#c_provider").onchange=cfgShow;
+$("#actionCopy").onclick=async()=>{const t=$("#actionCode");try{await navigator.clipboard.writeText(t.value)}catch(e){t.select();document.execCommand("copy")}$("#actionCopy").textContent="Copied";setTimeout(()=>$("#actionCopy").textContent="Copy",1500)};
 $("#c_validate").onclick=()=>cfgAction("validate"); $("#c_save").onclick=()=>cfgAction("save");
 $("#c_show").onclick=()=>{const i=$("#c_secret");i.type=i.type==="password"?"text":"password";$("#c_show").textContent=i.type==="password"?"Show":"Hide"};
 

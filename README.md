@@ -81,6 +81,8 @@ At startup, if the environment checks pass, it fetches the repository and compar
 
 The Operate section has four groups: **Apply settings** (first install, and after changing Settings), **Apply targets** (after changing Targets), **Stack** (start, stop, restart, status, logs) and **Test**. The update, image and apply steps are untested against a live stack.
 
+The Settings form has an Identity provider selector (generic OpenID Connect, Auth0 or Google). Choosing one shows only the fields it needs, the exact values to enter in that provider's dashboard (callback and logout URLs for your domain) and, for Auth0, a copyable login Action that adds a groups claim. The Auth0 and Google provider support is untested against real tenants.
+
 Install once: Python 3.12 or later, Git, Docker Desktop, then `pip install -r requirements.txt` (the `.cmd` does this for you).
 
 It listens on 127.0.0.1 only, but any web page open in your browser can send requests to localhost, so every request needs a random token (in the URL it prints), an exact `Host` header and, for changes, a matching `Origin` and a JSON body. It stops when you close the tab or press Quit. Use it on the machine itself; do not forward its port. Saving from the forms rewrites the YAML files, so hand-written comments in them are not kept. Untested on Windows.

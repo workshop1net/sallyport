@@ -10,10 +10,16 @@ acme_email: ops@msp.example
 # not trusted by browsers). Set to false for real certificates.
 acme_staging: true
 
-# OpenID Connect identity provider (the MSP's IdP, e.g. Entra ID or Okta).
+# Identity provider. provider is one of:
+#   oidc    any OpenID Connect provider (the default): set issuer
+#   auth0   Auth0: set domain (for example example.eu.auth0.com) instead of issuer; groups come from
+#           a login Action that adds the pomerium.io/groups claim (see the GUI's setup help)
+#   google  Google: no group support; list people under access.emails
+# For the generic provider this is the MSP's IdP, e.g. Entra ID or Okta.
 # Register this redirect URI with the IdP:
 #   https://authenticate.<domain>/oauth2/callback
 idp:
+  provider: oidc
   issuer: https://login.example.com/tenant-id/v2.0
   client_id: 00000000-0000-0000-0000-000000000000
   client_secret: change-me
