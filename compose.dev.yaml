@@ -51,10 +51,10 @@ services:
   # Throwaway RDP target (xrdp + XFCE) for testing RDP settings. The linuxserver/rdesktop
   # image is DEPRECATED and no longer updated, and it ships a default login abc / abc,
   # so it must only ever sit on the dev stack's targets network. Override the image
-  # with RDPTEST_IMAGE (for example a lscr.io/linuxserver/rdesktop:ubuntu-xfce tag).
+  # with RDPTEST_IMAGE. The :latest (Alpine) tag no longer has an amd64 build, hence ubuntu-xfce, which is large (several hundred MB).
   # xrdp does not do NLA, so its target must use "security: tls" and "ignore_cert: true".
   rdptest:
-    image: ${RDPTEST_IMAGE:-lscr.io/linuxserver/rdesktop:latest}
+    image: ${RDPTEST_IMAGE:-lscr.io/linuxserver/rdesktop:ubuntu-xfce}
     restart: unless-stopped
     shm_size: "1gb"
     environment:
