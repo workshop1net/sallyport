@@ -418,13 +418,6 @@ def make_action(name):
     def load_targets(state, job, body):
         return need_checkout(state, job) and run_core(job, core.cmd_load_targets, SimpleNamespace(dry_run=False))
 
-    def dry_run(state, job, body):
-        return need_checkout(state, job) and run_core(job, core.cmd_load_targets, SimpleNamespace(dry_run=True))
-
-    def check(state, job, body):
-        return need_checkout(state, job) and run_core(
-            job, core.cmd_check, SimpleNamespace(url=None, insecure=False, skip_ports=False))
-
     def ps(state, job, body):
         return need_checkout(state, job) and run_process(job, compose_cmd(state, "ps"), state.folder)
 
@@ -437,13 +430,13 @@ def make_action(name):
         return need_checkout(state, job) and run_process(job, compose_cmd(state, *args), state.folder)
 
     return {"update": action_update, "clone": action_clone_or_pull, "init": init, "apply_settings": apply_settings, "up": up, "restart": restart, "down": down,
-            "load_targets": load_targets, "dry_run": dry_run, "check": check, "ps": ps,
+            "load_targets": load_targets, "ps": ps,
             "logs": logs}.get(name)
 
 
 TITLES = {"update": "Update", "clone": "Clone / update repository", "init": "Initialise", "apply_settings": "Apply settings",
           "up": "Start", "restart": "Restart", "down": "Stop", "load_targets": "Apply targets",
-          "dry_run": "Preview target changes", "check": "Check exposure", "ps": "Status", "logs": "Logs"}
+          "ps": "Status", "logs": "Logs"}
 
 
 def start_job(state, name, body):
@@ -797,6 +790,9 @@ textarea.small{height:70px;font:12.5px/1.4 Consolas,monospace}
 .tlist div{padding:6px 8px;cursor:pointer;border-bottom:1px solid var(--bd)}.tlist div.on{background:#4a90d933;font-weight:600}
 .tlist small{opacity:.7;display:block}
 .hide{display:none!important}
+.maintabs{display:flex;gap:2px;border-bottom:2px solid var(--bd);margin:6px 0 14px}
+.maintabs button{border:1px solid var(--bd);border-bottom:none;border-radius:6px 6px 0 0;background:none;color:inherit;padding:8px 16px;margin-bottom:-2px}
+.maintabs button.on{font-weight:700;background:Canvas;border-bottom:2px solid Canvas}
 .banner{border:1px solid var(--bd);border-radius:8px;padding:8px 12px;margin-bottom:12px}
 .banner.upd{background:#4a90d922;border-color:#4a90d9}.banner ul{margin:4px 0 6px;padding-left:20px}
 .banner.bad{background:#c6282822}
@@ -811,18 +807,21 @@ details summary{cursor:pointer;margin-bottom:8px}
 </style></head><body>
 <h1>Sallyport</h1><div class="sub">Local control panel &mdash; listening on 127.0.0.1 only. <button id="quit">Quit</button></div>
 
+<div class="maintabs"><button id="tb_settings" data-t="settings" class="on">Settings &amp; system</button><button id="tb_targets" data-t="targets">Targets</button><button id="tb_raw" data-t="raw">Raw files</button></div>
+
+<div id="tab_settings" class="tabpanel">
 <div id="banner"></div>
 
-<section><details id="envd"><summary><b>1. Checks</b> <span id="envsum" class="sub"></span></summary>
+<section><details id="envd"><summary><b>Environment checks</b> <span id="envsum" class="sub"></span></summary>
 <div id="checks" class="chk">loading&hellip;</div>
 <div class="row"><button id="recheck">Check again</button></div></details></section>
 
-<section><details id="repod"><summary><b>2. Folder and repository</b> <span id="repsum" class="sub"></span></summary>
+<section><details id="repod"><summary><b>Folder and repository</b> <span id="repsum" class="sub"></span></summary>
 <div class="row"><label for="folder">Folder</label><input type="text" id="folder"></div>
 <div class="row"><label for="repo">Repository</label><input type="text" id="repo"></div>
 <div class="row"><button id="clone" class="p">Clone / update</button><span class="sub">clones into the folder if it is empty or new, otherwise runs <code>git pull</code></span></div></details></section>
 
-<section><h2>3. Settings</h2>
+<section><h2>Settings</h2>
 <div class="sub" id="cstatus"></div>
 <div class="grid">
 <label for="c_mode">Mode</label><select id="c_mode"><option value="production">Production (Let's Encrypt + your IdP)</option><option value="dev">Dev (local test: private certificate, mock login)</option></select>
@@ -848,7 +847,19 @@ details summary{cursor:pointer;margin-bottom:8px}
 <div class="row"><button id="c_validate">Validate</button><button id="c_save" class="p">Save settings</button><span id="cmsg" class="msg"></span><button id="c_apply" class="p hide" data-a="apply_settings">Apply settings and start now</button></div>
 <div class="warn">The client secret is stored in plain text in sallyport.yaml. Saving changes nothing in the running system until you apply the settings (see Operate below).</div></section>
 
-<section><h2>4. Targets</h2>
+<section><h2>Operate</h2>
+<div class="sub">New install: save your settings, press <b>Apply settings and start</b>, then switch to the Targets tab.</div>
+<div class="card"><h3>Apply settings</h3>
+<div class="sub">Use this the first time, and every time you change <b>Settings</b> above (domain, identity provider, who may log in, session lengths). It regenerates the generated configuration from <code>sallyport.yaml</code> and secrets, then (re)starts the stack, which ends any sessions in progress. Changing targets does not need this.</div>
+<div class="row"><button data-a="apply_settings" class="p">Apply settings and start</button></div></div>
+<div class="card"><h3>Stack</h3>
+<div class="sub">Day-to-day controls. Start and Stop leave your data alone. Restart recreates every container and ends sessions in progress.</div>
+<div class="row"><button data-a="up">Start</button><button data-a="down">Stop</button><button data-a="restart">Restart</button><button data-a="ps">Show status</button><button data-a="logs">Show recent logs</button></div></div>
+</section>
+</div>
+
+<div id="tab_targets" class="tabpanel hide">
+<section><h2>Targets</h2>
 <div class="sub" id="tstatus"></div>
 <div class="targets">
 <div><div id="tlist" class="tlist"></div>
@@ -870,32 +881,19 @@ details summary{cursor:pointer;margin-bottom:8px}
 <label for="t_max_sessions">Max sessions</label><input type="text" id="t_max_sessions" placeholder="1">
 </div></div>
 <div class="row"><button id="t_validate">Validate</button><button id="t_save" class="p">Save targets</button><span id="tmsg" class="msg"></span><button id="t_apply" class="p hide" data-a="load_targets">Apply targets now</button></div>
-<div class="warn">Credentials are stored in plain text in targets.yaml and in the database. Use dedicated, least-privilege service accounts. File transfer and printing are always off. Saving changes nothing in the running system until you apply the targets (see Operate below).</div></section>
+<div class="warn">Credentials are stored in plain text in targets.yaml and in the database. Use dedicated, least-privilege service accounts. File transfer and printing are always off. Saving changes nothing in the running system until you apply the targets (below).</div></section>
 
-<section><details><summary><b>Advanced: edit the raw YAML files</b></summary>
+<section><h2>Apply targets</h2>
+<div class="sub">Use this after you change targets above, and once after the first start. It copies <code>targets.yaml</code> into Guacamole, adding, changing and removing connections to match. No restart; sessions already open are not affected. The stack must be running.</div>
+<div class="row"><button data-a="load_targets" class="p">Apply targets</button></div></section>
+</div>
+
+<div id="tab_raw" class="tabpanel hide">
+<section><h2>Raw YAML files</h2><div class="sub">For anything the forms do not cover. Saving here replaces the whole file as written.</div>
 <div class="tabs row"><button data-f="sallyport.yaml" class="on">sallyport.yaml</button><button data-f="targets.yaml">targets.yaml</button><span id="fstate" class="sub"></span></div>
 <textarea id="editor" spellcheck="false"></textarea>
-<div class="row"><button id="validate">Validate</button><button id="save">Save</button><span id="fmsg" class="msg"></span></div></details></section>
-
-<section><h2>5. Operate</h2>
-<div class="sub">New install: save your settings, press <b>Apply settings and start</b>, then save your targets and press <b>Apply targets</b>.</div>
-
-<div class="card"><h3>Apply settings</h3>
-<div class="sub">Use this the first time, and every time you change <b>Settings</b> above (domain, identity provider, who may log in, session lengths). It regenerates the generated configuration from <code>sallyport.yaml</code> and secrets, then (re)starts the stack, which ends any sessions in progress. Changing targets does not need this.</div>
-<div class="row"><button data-a="apply_settings" class="p">Apply settings and start</button></div></div>
-
-<div class="card"><h3>Apply targets</h3>
-<div class="sub">Use this after you change <b>Targets</b> above, and once after the first start. It copies <code>targets.yaml</code> into Guacamole, adding, changing and removing connections to match. No restart; sessions already open are not affected. The stack must be running.</div>
-<div class="row"><button data-a="load_targets" class="p">Apply targets</button><button data-a="dry_run">Preview changes (changes nothing)</button></div></div>
-
-<div class="card"><h3>Stack</h3>
-<div class="sub">Day-to-day controls. Start and Stop leave your data alone. Restart recreates every container and ends sessions in progress.</div>
-<div class="row"><button data-a="up">Start</button><button data-a="down">Stop</button><button data-a="restart">Restart</button><button data-a="ps">Show status</button><button data-a="logs">Show recent logs</button></div></div>
-
-<div class="card"><h3>Test</h3>
-<div class="sub">Sends unauthenticated requests to the public address and confirms they are turned away, and that internal ports are not reachable. Run it from another machine for a meaningful result; from this machine it proves little.</div>
-<div class="row"><button data-a="check">Check exposure</button></div></div>
-</section>
+<div class="row"><button id="validate">Validate</button><button id="save">Save</button><span id="fmsg" class="msg"></span></div></section>
+</div>
 
 <div id="outpanel"><div id="outbar" class="row"><span id="oarrow">&#9650;</span> <b>Output</b> <span id="jtitle" class="sub"></span> <span id="jspin" class="spin hide"></span> <span id="jstate" class="msg"></span><span id="jlast" class="sub"></span>
 <button id="outclear" style="margin-left:auto">Clear</button></div><pre id="out" class="hide">Nothing run yet. Output from Update and the Operate buttons appears here.</pre></div>
@@ -938,11 +936,13 @@ async function refresh(){
 function bannerBox(cls){const b=$("#banner");b.textContent="";const d=document.createElement("div");d.className="banner "+(cls||"");b.appendChild(d);return d}
 function li(ul,t){const l=document.createElement("li");l.textContent=t;ul.appendChild(l)}
 let updTimer=null;
+function tabBadge(on){$("#tb_settings").textContent="Settings & system"+(on?" \u25CF":"")}
 async function checkUpdate(force){
   clearTimeout(updTimer);
   let u; try{u=await api("/api/update"+(force?"?force=1":""))}catch(e){return}
-  if(u.state==="checking"){const d=bannerBox();const sp=document.createElement("span");sp.className="spin";d.append(sp," "+u.message);updTimer=setTimeout(()=>checkUpdate(false),1500);return}
+  if(u.state==="checking"){tabBadge(false);const d=bannerBox();const sp=document.createElement("span");sp.className="spin";d.append(sp," "+u.message);updTimer=setTimeout(()=>checkUpdate(false),1500);return}
   if(u.state==="idle"){return}
+  tabBadge(u.state==="available");
   const again=(d,label)=>{const b=document.createElement("button");b.textContent=label||"Check again";b.onclick=()=>checkUpdate(true);d.append(" ",b)};
   if(u.state==="current"){const d=bannerBox();d.textContent="✔ Up to date (commit "+u.head+"). "+(u.message.replace("Up to date.","").trim()?u.message.replace("Up to date.","").trim()+" ":"");again(d);return}
   if(u.state==="skipped"){const d=bannerBox();d.textContent=u.message;return}
@@ -990,6 +990,11 @@ async function poll(){
 $("#outbar").onclick=()=>setOpen($("#out").classList.contains("hide"));
 $("#outclear").onclick=e=>{e.stopPropagation();$("#out").textContent="";$("#jlast").textContent="";setState("","")};
 $("#clone").onclick=()=>run("clone",{repo:$("#repo").value});
+function showTab(t){
+  $$(".tabpanel").forEach(x=>x.classList.toggle("hide",x.id!=="tab_"+t));
+  $$(".maintabs button").forEach(x=>x.classList.toggle("on",x.dataset.t===t));
+}
+$$(".maintabs button").forEach(b=>b.onclick=()=>showTab(b.dataset.t));
 $$("button[data-a]").forEach(b=>b.onclick=()=>run(b.dataset.a));
 $("#recheck").onclick=async()=>{try{await folderSet();await refresh();await loadFile();await loadForms();checkUpdate(true)}catch(e){say("error: "+e.message,"bad")}};
 $$(".tabs button[data-f]").forEach(b=>b.onclick=async()=>{

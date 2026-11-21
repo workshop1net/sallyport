@@ -1,11 +1,10 @@
-"""Sallyport core: generate config, load targets, run external checks.
+"""Sallyport core: generate configuration and load targets.
 
 Used by the ./sallyport command line and by the GUI (sallyport_gui.py).
 
 Commands:
   init           read sallyport.yaml, create secrets and generated config
   load-targets   write targets.yaml into the Guacamole database
-  check          probe the running service from outside (run it off-box)
 
 Requires Python 3 and PyYAML; dev mode also needs the cryptography package.
 """
@@ -15,12 +14,8 @@ import os
 import re
 import secrets
 import shutil
-import socket
-import ssl
 import subprocess
 import sys
-import urllib.error
-import urllib.request
 from pathlib import Path
 
 try:
@@ -404,7 +399,7 @@ def cmd_init(args):
     print("wrote generated/pomerium.yaml and generated/initdb/")
     print(f"\nNext:\n  1. DNS: {c['domain']} and authenticate.{c['domain']} -> this server\n"
           f"  2. IdP redirect URI: https://authenticate.{c['domain']}/oauth2/callback\n"
-          "  3. docker compose up -d\n  4. ./sallyport load-targets\n  5. ./sallyport check   (from another machine)")
+          "  3. docker compose up -d\n  4. ./sallyport load-targets")
     if c["staging"]:
         print("\nacme_staging is true: certificates will not be trusted by browsers. Set it to false\n"
               "in sallyport.yaml and re-run ./sallyport init, then docker compose up -d, once it works.")
@@ -572,70 +567,6 @@ def cmd_load_targets(args):
     print(f"loaded {len(targets)} target(s)")
 
 
-# ---------------------------------------------------------------------- check
-
-ALLOWED_UNAUTH = {301, 302, 303, 307, 308, 401, 403}
-PROBE_PATHS = ["/", "/api/languages", "/api/tokens", "/api/patches", "/websocket-tunnel", "/#/"]
-HIDDEN_PORTS = [8080, 4822, 5432]
-
-
-class NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, *a, **k):
-        return None
-
-
-def probe(url, context):
-    opener = urllib.request.build_opener(NoRedirect, urllib.request.HTTPSHandler(context=context))
-    try:
-        with opener.open(urllib.request.Request(url, headers={"User-Agent": "sallyport-check"}), timeout=10) as r:
-            return r.status, r.read(2048).decode("utf-8", "replace")
-    except urllib.error.HTTPError as e:
-        return e.code, ""
-    except (urllib.error.URLError, OSError) as e:
-        return None, str(e)
-
-
-def cmd_check(args):
-    if args.url:
-        base = args.url.rstrip("/")
-        host = None
-    else:
-        c = validate_config(load_yaml(CONFIG))
-        base = f"https://{c['domain']}"
-        host = c["domain"]
-        if c["mode"] == "dev":
-            args.insecure = True
-            args.skip_ports = True
-    context = ssl.create_default_context()
-    if args.insecure:
-        context.check_hostname = False
-        context.verify_mode = ssl.CERT_NONE
-    failures = 0
-    print(f"checking {base} without credentials\n")
-    for path in PROBE_PATHS:
-        status, body = probe(base + path, context)
-        if status is None:
-            print(f"FAIL  {path}: could not connect ({body})")
-            failures += 1
-        elif status in ALLOWED_UNAUTH and "guacamole" not in body.lower():
-            print(f"pass  {path}: {status}")
-        else:
-            print(f"FAIL  {path}: unauthenticated request got {status}")
-            failures += 1
-    if host and not args.skip_ports:
-        for port in HIDDEN_PORTS:
-            try:
-                socket.create_connection((host, port), timeout=3).close()
-                print(f"FAIL  port {port} is reachable from here; it must not be exposed")
-                failures += 1
-            except OSError:
-                print(f"pass  port {port} is not reachable")
-    print("\nrun this from another machine: from the server it proves little")
-    if failures:
-        sys.exit(f"{failures} check(s) failed")
-    print("all checks passed")
-
-
 def main():
     parser = argparse.ArgumentParser(prog="sallyport", description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -646,11 +577,6 @@ def main():
     p = sub.add_parser("load-targets", help="load targets.yaml into Guacamole")
     p.add_argument("--dry-run", action="store_true", help="print the SQL with secrets redacted and exit")
     p.set_defaults(func=cmd_load_targets)
-    p = sub.add_parser("check", help="probe the service from outside")
-    p.add_argument("--insecure", action="store_true", help="do not verify the TLS certificate (staging)")
-    p.add_argument("--url", help="probe this base URL instead of the configured domain")
-    p.add_argument("--skip-ports", action="store_true", help="skip the closed-port checks")
-    p.set_defaults(func=cmd_check)
     args = parser.parse_args()
     args.func(args)
 

@@ -47,7 +47,6 @@ chmod 600 sallyport.yaml targets.yaml
 ./sallyport init            # secrets, generated config, database schema
 docker compose up -d
 ./sallyport load-targets    # (re-run whenever targets.yaml changes)
-./sallyport check           # from ANOTHER machine
 ```
 
 Register `https://authenticate.<domain>/oauth2/callback` as the redirect URI with your IdP. Start with `acme_staging: true`; once Pomerium obtains a staging certificate, set it to `false`, re-run `./sallyport init` and `docker compose up -d`.
@@ -76,7 +75,7 @@ Never use dev mode on a server or any machine others can reach. Needs Docker Com
 
 ## Control panel (GUI)
 
-`sallyport-gui.cmd` (Windows) or `python sallyport_gui.py` (anywhere with Python 3) opens a small control panel in your browser. It checks that Docker, Compose and Git are present, clones or updates the repository into a folder you choose, has forms for every setting in `sallyport.yaml` and an editor for the targets (with a raw-YAML view for anything else), validates before saving, and has buttons for Initialise, Start, Restart, Stop, Load targets, Check, Status and Logs. It uses the same code as the command line.
+`sallyport-gui.cmd` (Windows) or `python sallyport_gui.py` (anywhere with Python 3) opens a small control panel in your browser. It checks that Docker, Compose and Git are present, clones or updates the repository into a folder you choose, has forms for every setting in `sallyport.yaml` and an editor for the targets (with a raw-YAML view for anything else), validates before saving, and has buttons to apply settings, apply targets, and start, stop or restart the stack. It uses the same code as the command line.
 
 At startup, if the environment checks pass, it fetches the repository and compares the stack's container images with their registries (by digest, without downloading them). If either has changed it shows a banner with the new commits, the newer images and the steps an update involves (re-initialise, download images, recreate containers, reload targets), worked out from the files that changed. The single **Update** button does all of it. Recreating containers interrupts active sessions. The image check needs the `docker buildx` plugin and registry access; if it cannot run, the banner says so. The checks and folder sections collapse when everything is fine, and the Output panel stays collapsed at the bottom until you open it (it opens by itself when you start an action).
 
@@ -100,7 +99,6 @@ sallyport.cmd load-targets
 
 Notes:
 - `load-targets` needs the stack running, because it connects to the database over the stack's internal network.
-- `sallyport.cmd check` runs in a container on the same machine, so it proves little. Use `sallyport.cmd check --url https://<domain>` from a different network, or run it from another machine.
 - Ports 80 and 443 must be forwarded to the Windows host and allowed through its firewall for Let's Encrypt. A desktop or laptop that sleeps is a poor gateway; use an always-on machine.
 - Windows file permissions do not protect `.env`, `sallyport.yaml` or `targets.yaml` the way mode 0600 does on Linux. Keep them in a folder only administrators can read.
 - Untested on Windows. Please report anything that breaks.
@@ -136,10 +134,6 @@ Treat these as the to-do list, not as footnotes.
 - **Not a full desktop replacement,** and file transfer is off. Engineers who need to move files will need another route.
 - **The helper script and Compose file are untested against live containers.** See below.
 
-## Checks
-
-`./sallyport check` requests several paths without credentials and fails if any returns 200 or Guacamole content. It also tries to connect to ports that must not be exposed (8080, 4822, 5432). Run it from another machine. It is a start on a proper conformance suite; useful additions are a spoofed `X-Pomerium-Claim-Email` header test, an expired-session test (does an open tunnel survive when the Pomerium session expires?), and a leaver test.
-
 ## Upgrades
 
 The database schema and setup scripts run only when the `postgres-data` volume is first created. To change them on an existing install, apply the SQL by hand. To pull newer images: `docker compose pull && docker compose up -d`. Back up the `postgres-data` volume first.
@@ -159,7 +153,7 @@ compose.yaml              the stack (do not edit per deployment)
 compose.hardening.yaml    optional hardening overlay (untested)
 compose.dev.yaml          dev-mode overlay: Dex login, private CA, test SSH target
 sallyport.dev.example.yaml  dev-mode config template
-sallyport                 helper: init, load-targets, check
+sallyport                 helper: init, load-targets
 sallyport.cmd             Windows wrapper: runs the helper in a container (no Python needed)
 sallyport_core.py         the logic behind the command line and the GUI
 sallyport_gui.py          loopback web control panel

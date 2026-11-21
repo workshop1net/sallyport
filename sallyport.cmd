@@ -1,11 +1,11 @@
 @echo off
 rem Runs the Sallyport helper inside Docker, so Python is not needed on the host.
-rem Usage: sallyport.cmd init | load-targets [--dry-run] | check [--insecure] [--url URL]
+rem Usage: sallyport.cmd init | load-targets [--dry-run]
 setlocal
 cd /d "%~dp0"
 
 if "%~1"=="" (
-  echo usage: sallyport.cmd init ^| load-targets ^| check
+  echo usage: sallyport.cmd init ^| load-targets
   exit /b 2
 )
 
