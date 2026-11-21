@@ -80,7 +80,7 @@ def nonempty_str(section, key, value, maxlen=4000):
 
 # ---------------------------------------------------------------- config / init
 
-DEV_EMAIL = "kilgore@kilgore.kilgore"  # the fixed user Dex's mock connector signs in
+DEV_EMAIL = "kilgore@kilgore.trout"  # the fixed user Dex's mock connector signs in
 DEV_CLIENT_ID = "sallyport"
 
 
@@ -340,7 +340,7 @@ def cmd_init(args):
               "  2. load-targets (loads the test SSH target)\n"
               f"  3. open https://{d} and accept the certificate warning (or trust generated/certs/ca.crt);\n"
               f"     first open https://dex.{d}:5556 once and accept its warning too if the login redirect fails.\n"
-              "  Sign-in is automatic as kilgore@kilgore.kilgore (Dex's mock connector).")
+              "  Sign-in is automatic as kilgore@kilgore.trout (Dex's mock connector).")
         return
     print(f"wrote {ENV_FILE.name} (new secrets: {', '.join(new) or 'none, existing kept'})")
     print("wrote generated/pomerium.yaml and generated/initdb/")
