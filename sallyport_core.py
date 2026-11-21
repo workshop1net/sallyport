@@ -414,7 +414,6 @@ COMMON_KEYS = {"name", "protocol", "host", "port", "username", "password", "clip
 PROTOCOL_KEYS = {
     "rdp": COMMON_KEYS | {"domain", "security", "ignore_cert"},
     "ssh": COMMON_KEYS | {"private_key", "passphrase", "host_key"},
-    "vnc": COMMON_KEYS,
 }
 SECRET_PARAMS = {"password", "private-key", "passphrase"}
 
@@ -427,7 +426,7 @@ def q(value):
 def target_params(t):
     proto = t["protocol"]
     section = f"target '{t['name']}'"
-    port = t.get("port", {"rdp": 3389, "ssh": 22, "vnc": 5900}[proto])
+    port = t.get("port", {"rdp": 3389, "ssh": 22}[proto])
     if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
         die(f"{section}: port must be 1-65535")
     host = t["host"]
@@ -464,10 +463,6 @@ def target_params(t):
             die(f"{section}: ssh targets need a username")
         if "password" not in t and "private_key" not in t:
             die(f"{section}: ssh targets need a password or private_key")
-    else:  # vnc
-        params.append(("enable-sftp", "false"))
-        if "password" not in t:
-            die(f"{section}: vnc targets need a password")
 
     clipboard = t.get("clipboard", "both")
     if clipboard not in CLIPBOARD:

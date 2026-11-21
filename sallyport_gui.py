@@ -673,7 +673,7 @@ details summary{cursor:pointer;margin-bottom:8px}
 <div class="row"><button id="t_add">Add</button><button id="t_dup">Duplicate</button><button id="t_del">Delete</button></div></div>
 <div id="tform" class="grid">
 <label for="t_name">Name</label><input type="text" id="t_name">
-<label for="t_protocol">Protocol</label><select id="t_protocol"><option>rdp</option><option>ssh</option><option>vnc</option></select>
+<label for="t_protocol">Protocol</label><select id="t_protocol"><option>rdp</option><option>ssh</option></select>
 <label for="t_host">Host</label><input type="text" id="t_host" placeholder="10.0.0.10 or server.corp">
 <label for="t_port">Port</label><input type="text" id="t_port" placeholder="default for the protocol">
 <label for="t_username">Username</label><input type="text" id="t_username" autocomplete="off">
@@ -813,7 +813,7 @@ $("#c_show").onclick=()=>{const i=$("#c_secret");i.type=i.type==="password"?"tex
 
 /* ---- targets editor ---- */
 const TF=["name","protocol","host","port","username","password","domain","security","private_key","passphrase","host_key","clipboard","max_sessions"];
-const KEYS={common:["name","protocol","host","port","username","password","clipboard","max_sessions"],rdp:["domain","security","ignore_cert"],ssh:["private_key","passphrase","host_key"],vnc:[]};
+const KEYS={common:["name","protocol","host","port","username","password","clipboard","max_sessions"],rdp:["domain","security","ignore_cert"],ssh:["private_key","passphrase","host_key"]};
 let targets=[], sel=-1;
 const blank=()=>({name:"",protocol:"rdp",host:"",security:"nla",ignore_cert:false,clipboard:"both",max_sessions:1});
 function tShowFields(){const p=$("#t_protocol").value;

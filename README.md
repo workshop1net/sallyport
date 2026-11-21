@@ -19,7 +19,7 @@ A small, self-hosted gateway for giving third parties (an MSP's engineers, a ven
         | identity header, internal network only
         v
    +-----------+     +-----------+
-   | Guacamole |---->|  guacd    |-----> RDP / SSH / VNC to target systems
+   | Guacamole |---->|  guacd    |-----> RDP / SSH to target systems
    | web app   |     +-----------+
    +-----+-----+
          v

@@ -37,11 +37,6 @@ targets:
                                      # accepts any host key
     clipboard: both
 
-  - name: kvm01
-    protocol: vnc
-    host: 10.0.0.20
-    password: change-me
-    clipboard: none
-
-# File transfer (RDP drive redirection, RDP upload/download, SFTP) and printing
-# are always off. There is deliberately no option to enable them in the MVP.
+# VNC is deliberately not supported.
+# File transfer (RDP drive redirection, RDP upload/download, SFTP) and printing are
+# always off. There is deliberately no option to enable them in the MVP.
