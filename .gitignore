@@ -1,0 +1,6 @@
+# Deployment-specific files with secrets or generated content
+.env
+sallyport.yaml
+targets.yaml
+generated/
+__pycache__/

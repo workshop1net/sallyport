@@ -1,0 +1,37 @@
+# Sallyport operator configuration. Copy to sallyport.yaml and edit.
+# sallyport.yaml contains a client secret: keep it out of version control
+# (it is in .gitignore) and readable only by the account running Sallyport.
+
+# DNS: both <domain> and authenticate.<domain> must resolve to this server, and
+# ports 80 and 443 must be reachable from the internet for Let's Encrypt.
+domain: access.client.example
+acme_email: ops@msp.example
+# Use Let's Encrypt's staging CA until everything works (staging certificates are
+# not trusted by browsers). Set to false for real certificates.
+acme_staging: true
+
+# OpenID Connect identity provider (the MSP's IdP, e.g. Entra ID or Okta).
+# Register this redirect URI with the IdP:
+#   https://authenticate.<domain>/oauth2/callback
+idp:
+  issuer: https://login.example.com/tenant-id/v2.0
+  client_id: 00000000-0000-0000-0000-000000000000
+  client_secret: change-me
+  scopes: [openid, profile, email]
+
+# Who may reach Sallyport at all. Anyone Pomerium admits becomes a Guacamole
+# user who can see every target. At least one entry is required.
+access:
+  # Exact email addresses (as the IdP asserts them).
+  emails:
+    - alice@msp.example
+  # Group membership, matched against a claim in the ID token. Use immutable
+  # group IDs, not display names. The IdP must be configured to emit the claim.
+  # Removal from a group takes effect when the user's session ends or they sign
+  # in again, so keep session.lifetime short.
+  groups: []
+  groups_claim: groups
+
+session:
+  lifetime: 8h # how long a login lasts before the user must sign in again
+  idle_timeout: 30m

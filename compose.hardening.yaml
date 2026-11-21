@@ -1,0 +1,26 @@
+# Optional hardening overlay. UNTESTED: these restrictions may stop a container
+# from starting on some image versions. Try it in a lab first:
+#
+#   docker compose -f compose.yaml -f compose.hardening.yaml up -d
+#
+# If a container fails to start, check its logs and relax that service's
+# settings here rather than editing compose.yaml.
+
+services:
+  pomerium:
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+
+  guacamole:
+    cap_drop: [ALL]
+
+  guacd:
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+
+  postgres:
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]

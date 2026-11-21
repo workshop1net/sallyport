@@ -1,0 +1,47 @@
+# Systems that Sallyport users may connect to. Copy to targets.yaml and edit, then
+# run ./sallyport load-targets. targets.yaml contains credentials: it is in
+# .gitignore, and should be readable only by the account running Sallyport.
+#
+# MVP: credentials are stored in the Guacamole database in plain text. Use
+# dedicated service accounts with least privilege, never personal credentials.
+#
+# Unknown keys are rejected on purpose, so a typo cannot silently weaken a setting.
+
+targets:
+  - name: dc01
+    protocol: rdp
+    host: 10.0.0.10
+    # port: 3389
+    username: svc-sallyport
+    password: change-me
+    # domain: CORP
+    security: nla          # nla (default) | tls | rdp | any
+    ignore_cert: false     # true accepts the server's self-signed RDP certificate
+                           # without checking it, which allows interception
+                           # on the path between guacd and the target
+    clipboard: both        # both (default) | none | paste-only | copy-only
+                           # paste-only: user to target; copy-only: target to user
+    max_sessions: 1        # simultaneous sessions on this target, all users
+
+  - name: fw01
+    protocol: ssh
+    host: 10.0.0.1
+    username: svc-sallyport
+    private_key: |
+      -----BEGIN OPENSSH PRIVATE KEY-----
+      ...
+      -----END OPENSSH PRIVATE KEY-----
+    # passphrase: change-me
+    # password: change-me  # alternative to private_key
+    host_key: "ssh-ed25519 AAAA..."  # strongly recommended: without it guacd
+                                     # accepts any host key
+    clipboard: both
+
+  - name: kvm01
+    protocol: vnc
+    host: 10.0.0.20
+    password: change-me
+    clipboard: none
+
+# File transfer (RDP drive redirection, RDP upload/download, SFTP) and printing
+# are always off. There is deliberately no option to enable them in the MVP.
