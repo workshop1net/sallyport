@@ -386,6 +386,10 @@ def cmd_init(args):
     shutil.copy(ROOT / "sql" / "003-app-role.sh", initdb / "003-app-role.sh")
     os.chmod(initdb / "003-app-role.sh", 0o755)
 
+    quiet = getattr(args, "quiet", False)
+    if quiet:
+        print("wrote .env and the generated configuration")
+        return
     if c["mode"] == "dev":
         d = c["domain"]
         print("wrote .env, generated/pomerium.yaml, generated/dex.yaml, generated/certs/ and generated/initdb/")

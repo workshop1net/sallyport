@@ -213,6 +213,42 @@ def plan_for(folder, files):
     return {"steps": steps, "notes": notes, "gui_changed": gui_changed}
 
 
+def compose_files(state):
+    return ["-f", "compose.yaml", "-f", "compose.dev.yaml"] if stack_mode(state) == "dev" else []
+
+
+def image_state(image):
+    """'outdated' | 'current' | 'missing' | 'unknown' for one image, without downloading it."""
+    rc, out, _ = run_quiet(["docker", "image", "inspect", "--format", "{{json .RepoDigests}}", image])
+    if rc != 0:
+        return "missing"  # not downloaded yet: starting the stack will fetch it
+    try:
+        local = json.loads(out) or []
+    except ValueError:
+        return "unknown"
+    rc, out, _ = run_quiet(["docker", "buildx", "imagetools", "inspect", image], timeout=45)
+    m = re.search(r"^Digest:\s+(sha256:[0-9a-f]{64})", out or "", re.M)
+    if rc != 0 or not m:
+        return "unknown"
+    return "current" if any(d.endswith("@" + m.group(1)) for d in local) else "outdated"
+
+
+def check_images(state, folder):
+    """Compare each image the stack uses with its registry, by digest only (no downloads).
+    Best effort: the result says so when it could not check."""
+    rc, out, _ = run_quiet(["docker", "compose", *compose_files(state), "config", "--images"], cwd=folder, timeout=40)
+    if rc != 0 or not out.split():
+        return {"outdated": [], "note": "Could not list the stack's container images."}
+    images = sorted(set(out.split()))
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        states = dict(zip(images, pool.map(image_state, images)))
+    outdated = [i for i, st in states.items() if st == "outdated"]
+    unknown = [i for i, st in states.items() if st == "unknown"]
+    note = f"Could not check {len(unknown)} image(s) against the registry." if unknown else ""
+    return {"outdated": outdated, "note": note}
+
+
 def update_worker(state, folder, u):
     def finish(**kw):
         if u.get("folder") == str(folder):
@@ -235,17 +271,23 @@ def update_worker(state, folder, u):
     except ValueError:
         return finish(state="error", message="Could not compare with the upstream branch: " + (err or out))
     rc, head, _ = git(folder, "rev-parse", "--short", "HEAD")
-    if behind == 0:
-        return finish(state="current", head=head, message="Up to date.", ahead=ahead)
-    if ahead:
+    if ahead and behind:
         return finish(state="diverged", head=head, ahead=ahead, behind=behind,
                       message=f"This checkout has {ahead} local commit(s) and is {behind} behind; update it by hand with git.")
-    rc, dirty, _ = git(folder, "status", "--porcelain", "--untracked-files=no")
-    rc, subjects, _ = git(folder, "log", "--format=%h %s", "-n", "8", "HEAD..@{u}")
-    rc, files, _ = git(folder, "diff", "--name-only", "HEAD..@{u}")
-    plan = plan_for(folder, [f for f in files.splitlines() if f])
-    finish(state="behind", head=head, behind=behind, commits=subjects.splitlines(), plan=plan,
-           dirty=bool(dirty), message=f"{behind} new commit(s) available.")
+    images = check_images(state, folder) if initialised(folder) else {"outdated": [], "note": ""}
+    commits, plan, dirty = [], {"steps": [], "notes": [], "gui_changed": False}, False
+    if behind:
+        rc, dirty_out, _ = git(folder, "status", "--porcelain", "--untracked-files=no")
+        dirty = bool(dirty_out)
+        rc, subjects, _ = git(folder, "log", "--format=%h %s", "-n", "8", "HEAD..@{u}")
+        commits = subjects.splitlines()
+        rc, files, _ = git(folder, "diff", "--name-only", "HEAD..@{u}")
+        plan = plan_for(folder, [f for f in files.splitlines() if f])
+    if not behind and not images["outdated"]:
+        note = (" " + images["note"]) if images["note"] else ""
+        return finish(state="current", head=head, message="Up to date." + note)
+    finish(state="available", head=head, behind=behind, commits=commits, plan=plan, dirty=dirty,
+           images=images["outdated"], image_note=images["note"], message="")
 
 
 def update_status(state, force=False):
@@ -254,7 +296,7 @@ def update_status(state, force=False):
         if u.get("state") == "checking":
             return dict(u)
         if force or u.get("folder") != str(state.folder):
-            u = state.update = {"folder": str(state.folder), "state": "checking", "message": "Checking for updates…"}
+            u = state.update = {"folder": str(state.folder), "state": "checking", "message": "Checking for updates and newer container images…"}
             threading.Thread(target=update_worker, args=(state, state.folder, u), daemon=True).start()
         return dict(u)
 
@@ -263,25 +305,24 @@ def action_update(state, job, body):
     """Pull, then apply what the new files need. Steps that depend on the code just pulled run
     as fresh processes: this process still has the old code loaded."""
     folder = state.folder
-    apply_changes, images = bool(body.get("apply")), bool(body.get("images"))
+    with state.lock:
+        images_outdated = list(state.update.get("images") or [])
     rc, files, _ = git(folder, "diff", "--name-only", "HEAD..@{u}")
     plan = plan_for(folder, [f for f in files.splitlines() if f]) if rc == 0 else {"steps": [], "notes": [], "gui_changed": False}
-    if not run_process(job, ["git", "pull", "--ff-only"], folder):
+    if files.strip() and not run_process(job, ["git", "pull", "--ff-only"], folder):
         return False
     ids = {st["id"] for st in plan["steps"]}
     me = [sys.executable, "-I", str(folder / "sallyport")]
-    if apply_changes:
-        if "init" in ids and not run_process(job, me + ["init"], folder):
+    if "init" in ids and not run_process(job, me + ["init"], folder):
+        return False
+    if images_outdated and initialised(folder) and not run_process(job, compose_cmd(state, "pull"), folder):
+        return False
+    if "restart" in ids or images_outdated:
+        args = ["up", "-d"] + (["--force-recreate"] if "restart" in ids else [])
+        if not run_process(job, compose_cmd(state, *args), folder):
             return False
-        if images and initialised(folder) and not run_process(job, compose_cmd(state, "pull"), folder):
-            return False
-        if ("restart" in ids or (images and initialised(folder))) and not run_process(
-                job, compose_cmd(state, "up", "-d", "--force-recreate"), folder):
-            return False
-        if "load_targets" in ids and not run_process(job, me + ["load-targets"], folder):
-            return False
-    else:
-        job.add("Pulled only. Steps still to do: " + (", ".join(st["text"] for st in plan["steps"]) or "none"))
+    if "load_targets" in ids and not run_process(job, me + ["load-targets"], folder):
+        return False
     for note in plan["notes"]:
         job.add("NOTE: " + note)
     job.add("Update finished.")
@@ -350,6 +391,20 @@ def make_action(name):
     def init(state, job, body):
         return need_checkout(state, job) and run_core(job, core.cmd_init, SimpleNamespace(no_schema=False))
 
+    def apply_settings(state, job, body):
+        if not need_checkout(state, job):
+            return False
+        if not run_core(job, core.cmd_init, SimpleNamespace(no_schema=False, quiet=True)):
+            return False
+        if not run_process(job, compose_cmd(state, "up", "-d", "--force-recreate"), state.folder):
+            return False
+        try:
+            domain = yaml.safe_load(core.CONFIG.read_text(encoding="utf-8")).get("domain", "")
+        except (OSError, yaml.YAMLError, AttributeError):
+            domain = ""
+        job.add(f"Settings applied. Open https://{domain}" + (" (accept the certificate warning in dev mode)" if stack_mode(state) == "dev" else ""))
+        return True
+
     def up(state, job, body):
         return need_checkout(state, job) and run_process(job, compose_cmd(state, "up", "-d"), state.folder)
 
@@ -381,14 +436,14 @@ def make_action(name):
         args = ["logs", "--tail", "200"] + ([service] if service else [])
         return need_checkout(state, job) and run_process(job, compose_cmd(state, *args), state.folder)
 
-    return {"update": action_update, "clone": action_clone_or_pull, "init": init, "up": up, "restart": restart, "down": down,
+    return {"update": action_update, "clone": action_clone_or_pull, "init": init, "apply_settings": apply_settings, "up": up, "restart": restart, "down": down,
             "load_targets": load_targets, "dry_run": dry_run, "check": check, "ps": ps,
             "logs": logs}.get(name)
 
 
-TITLES = {"update": "Update", "clone": "Clone / update", "init": "Initialise", "up": "Start", "restart": "Restart (recreate)",
-          "down": "Stop", "load_targets": "Load targets", "dry_run": "Targets dry run", "check": "Check",
-          "ps": "Status", "logs": "Logs"}
+TITLES = {"update": "Update", "clone": "Clone / update repository", "init": "Initialise", "apply_settings": "Apply settings",
+          "up": "Start", "restart": "Restart", "down": "Stop", "load_targets": "Apply targets",
+          "dry_run": "Preview target changes", "check": "Check exposure", "ps": "Status", "logs": "Logs"}
 
 
 def start_job(state, name, body):
@@ -745,7 +800,11 @@ textarea.small{height:70px;font:12.5px/1.4 Consolas,monospace}
 .banner{border:1px solid var(--bd);border-radius:8px;padding:8px 12px;margin-bottom:12px}
 .banner.upd{background:#4a90d922;border-color:#4a90d9}.banner ul{margin:4px 0 6px;padding-left:20px}
 .banner.bad{background:#c6282822}
-#outpanel{position:sticky;bottom:0;background:Canvas;color:CanvasText;border-top:2px solid var(--bd);padding:6px 0 8px;margin-top:10px}
+#outpanel{position:sticky;bottom:0;background:Canvas;color:CanvasText;border-top:2px solid var(--bd);padding:2px 0 6px;margin-top:10px}
+#outbar{cursor:pointer;margin:2px 0}#jlast{max-width:46%;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+.spin{display:inline-block;width:12px;height:12px;border:2px solid var(--bd);border-top-color:#4a90d9;border-radius:50%;animation:sp .8s linear infinite;vertical-align:-2px}
+@keyframes sp{to{transform:rotate(360deg)}}
+.card{border:1px solid var(--bd);border-radius:6px;padding:8px 12px;margin:10px 0}.card h3{margin:0 0 4px;font-size:14px}
 body{padding-bottom:0}
 details summary{cursor:pointer;margin-bottom:8px}
 .warn{background:#f9a82522;border:1px solid #f9a82588;border-radius:6px;padding:6px 10px;margin:8px 0}
@@ -786,8 +845,8 @@ details summary{cursor:pointer;margin-bottom:8px}
 <label for="c_life">Session lifetime</label><input type="text" id="c_life" placeholder="8h">
 <label for="c_idle">Idle timeout</label><input type="text" id="c_idle" placeholder="30m">
 </div>
-<div class="row"><button id="c_validate">Validate</button><button id="c_save" class="p">Save settings</button><span id="cmsg" class="msg"></span></div>
-<div class="warn">The client secret is stored in plain text in sallyport.yaml. After changing settings, run Initialise, then Restart.</div></section>
+<div class="row"><button id="c_validate">Validate</button><button id="c_save" class="p">Save settings</button><span id="cmsg" class="msg"></span><button id="c_apply" class="p hide" data-a="apply_settings">Apply settings and start now</button></div>
+<div class="warn">The client secret is stored in plain text in sallyport.yaml. Saving changes nothing in the running system until you apply the settings (see Operate below).</div></section>
 
 <section><h2>4. Targets</h2>
 <div class="sub" id="tstatus"></div>
@@ -810,21 +869,36 @@ details summary{cursor:pointer;margin-bottom:8px}
 <label for="t_clipboard">Clipboard</label><select id="t_clipboard"><option value="both">both ways</option><option value="none">none</option><option value="paste-only">paste only (you to target)</option><option value="copy-only">copy only (target to you)</option></select>
 <label for="t_max_sessions">Max sessions</label><input type="text" id="t_max_sessions" placeholder="1">
 </div></div>
-<div class="row"><button id="t_validate">Validate</button><button id="t_save" class="p">Save targets</button><span id="tmsg" class="msg"></span></div>
-<div class="warn">Credentials are stored in plain text in targets.yaml and in the database. Use dedicated, least-privilege service accounts. File transfer and printing are always off. After saving, run Load targets.</div></section>
+<div class="row"><button id="t_validate">Validate</button><button id="t_save" class="p">Save targets</button><span id="tmsg" class="msg"></span><button id="t_apply" class="p hide" data-a="load_targets">Apply targets now</button></div>
+<div class="warn">Credentials are stored in plain text in targets.yaml and in the database. Use dedicated, least-privilege service accounts. File transfer and printing are always off. Saving changes nothing in the running system until you apply the targets (see Operate below).</div></section>
 
 <section><details><summary><b>Advanced: edit the raw YAML files</b></summary>
 <div class="tabs row"><button data-f="sallyport.yaml" class="on">sallyport.yaml</button><button data-f="targets.yaml">targets.yaml</button><span id="fstate" class="sub"></span></div>
 <textarea id="editor" spellcheck="false"></textarea>
 <div class="row"><button id="validate">Validate</button><button id="save">Save</button><span id="fmsg" class="msg"></span></div></details></section>
 
-<section><h2>5. Run</h2>
-<div class="row"><button data-a="init" class="p">Initialise</button><button data-a="up" class="p">Start</button><button data-a="restart">Restart (recreate)</button><button data-a="down">Stop</button><button data-a="load_targets" class="p">Load targets</button><button data-a="dry_run">Targets dry run</button><button data-a="check">Check service</button><button data-a="ps">Status</button><button data-a="logs">Logs</button></div>
-<div class="sub">Order for a new install: Clone, save settings and targets, Initialise, Start, Load targets. Re-run Initialise after changing sallyport.yaml, then Restart. Re-run Load targets after changing targets.yaml.</div>
+<section><h2>5. Operate</h2>
+<div class="sub">New install: save your settings, press <b>Apply settings and start</b>, then save your targets and press <b>Apply targets</b>.</div>
+
+<div class="card"><h3>Apply settings</h3>
+<div class="sub">Use this the first time, and every time you change <b>Settings</b> above (domain, identity provider, who may log in, session lengths). It regenerates the generated configuration from <code>sallyport.yaml</code> and secrets, then (re)starts the stack, which ends any sessions in progress. Changing targets does not need this.</div>
+<div class="row"><button data-a="apply_settings" class="p">Apply settings and start</button></div></div>
+
+<div class="card"><h3>Apply targets</h3>
+<div class="sub">Use this after you change <b>Targets</b> above, and once after the first start. It copies <code>targets.yaml</code> into Guacamole, adding, changing and removing connections to match. No restart; sessions already open are not affected. The stack must be running.</div>
+<div class="row"><button data-a="load_targets" class="p">Apply targets</button><button data-a="dry_run">Preview changes (changes nothing)</button></div></div>
+
+<div class="card"><h3>Stack</h3>
+<div class="sub">Day-to-day controls. Start and Stop leave your data alone. Restart recreates every container and ends sessions in progress.</div>
+<div class="row"><button data-a="up">Start</button><button data-a="down">Stop</button><button data-a="restart">Restart</button><button data-a="ps">Show status</button><button data-a="logs">Show recent logs</button></div></div>
+
+<div class="card"><h3>Test</h3>
+<div class="sub">Sends unauthenticated requests to the public address and confirms they are turned away, and that internal ports are not reachable. Run it from another machine for a meaningful result; from this machine it proves little.</div>
+<div class="row"><button data-a="check">Check exposure</button></div></div>
 </section>
 
-<div id="outpanel"><div class="row"><b>Output</b> <span id="jtitle" class="sub"></span> <span id="jstate" class="msg"></span>
-<button id="outclear" style="margin-left:auto">Clear</button></div><pre id="out">Nothing run yet. Output from Clone / update and the Run buttons appears here.</pre></div>
+<div id="outpanel"><div id="outbar" class="row"><span id="oarrow">&#9650;</span> <b>Output</b> <span id="jtitle" class="sub"></span> <span id="jspin" class="spin hide"></span> <span id="jstate" class="msg"></span><span id="jlast" class="sub"></span>
+<button id="outclear" style="margin-left:auto">Clear</button></div><pre id="out" class="hide">Nothing run yet. Output from Update and the Operate buttons appears here.</pre></div>
 <script>
 "use strict";
 const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
@@ -837,8 +911,10 @@ async function api(path,body){
   const r=await fetch(path,o); let j={}; try{j=await r.json()}catch(e){}
   if(!r.ok) throw new Error(j.error||("HTTP "+r.status)); return j;
 }
-function setState(t,cls){const e=$("#jstate");e.textContent=t;e.className="msg "+cls}
-function say(t,cls){const o=$("#out");const d=document.createElement("div");d.textContent=t;if(cls)d.className=cls;o.appendChild(d);o.scrollTop=o.scrollHeight}
+function setState(t,cls,spin){const e=$("#jstate");e.textContent=t;e.className="msg "+cls;$("#jspin").classList.toggle("hide",!spin)}
+function setOpen(open){$("#out").classList.toggle("hide",!open);$("#oarrow").innerHTML=open?"&#9660;":"&#9650;"}
+function say(t,cls){const o=$("#out");const d=document.createElement("div");d.textContent=t;if(cls)d.className=cls;o.appendChild(d);o.scrollTop=o.scrollHeight;
+  if(t.trim())$("#jlast").textContent=" — "+t.trim()}
 async function refresh(){
   const s=await api("/api/state");
   if(document.activeElement!==$("#folder"))$("#folder").value=s.folder;
@@ -865,26 +941,25 @@ let updTimer=null;
 async function checkUpdate(force){
   clearTimeout(updTimer);
   let u; try{u=await api("/api/update"+(force?"?force=1":""))}catch(e){return}
-  if(u.state==="checking"){const d=bannerBox();d.textContent=u.message;updTimer=setTimeout(()=>checkUpdate(false),1500);return}
+  if(u.state==="checking"){const d=bannerBox();const sp=document.createElement("span");sp.className="spin";d.append(sp," "+u.message);updTimer=setTimeout(()=>checkUpdate(false),1500);return}
   if(u.state==="idle"){return}
-  if(u.state==="current"){const d=bannerBox();d.textContent="✔ Up to date (commit "+u.head+"). ";
-    const b=document.createElement("button");b.textContent="Check again";b.onclick=()=>checkUpdate(true);d.appendChild(b);return}
+  const again=(d,label)=>{const b=document.createElement("button");b.textContent=label||"Check again";b.onclick=()=>checkUpdate(true);d.append(" ",b)};
+  if(u.state==="current"){const d=bannerBox();d.textContent="✔ Up to date (commit "+u.head+"). "+(u.message.replace("Up to date.","").trim()?u.message.replace("Up to date.","").trim()+" ":"");again(d);return}
   if(u.state==="skipped"){const d=bannerBox();d.textContent=u.message;return}
-  if(u.state==="error"||u.state==="diverged"){const d=bannerBox("bad");d.textContent=u.message+" ";
-    const b=document.createElement("button");b.textContent="Retry";b.onclick=()=>checkUpdate(true);d.appendChild(b);return}
-  if(u.state==="behind"){
-    const d=bannerBox("upd");const h=document.createElement("b");h.textContent="Update available: "+u.message;d.appendChild(h);
-    const ul=document.createElement("ul");u.commits.forEach(c=>li(ul,c));d.appendChild(ul);
-    if(u.plan.steps.length){const p=document.createElement("div");p.textContent="Updating and applying will:";d.appendChild(p);
-      const ol=document.createElement("ul");li(ol,"Pull the new version");u.plan.steps.forEach(x=>li(ol,x.text));d.appendChild(ol)}
-    else{const p=document.createElement("div");p.textContent="Nothing needs re-applying after the pull.";d.appendChild(p)}
-    u.plan.notes.forEach(n=>{const p=document.createElement("div");p.className="sub";p.textContent="⚠ "+n;d.appendChild(p)});
-    if(u.dirty){const p=document.createElement("div");p.className="bad";p.textContent="This checkout has local changes to tracked files; the pull may refuse to run.";d.appendChild(p)}
+  if(u.state==="error"||u.state==="diverged"){const d=bannerBox("bad");d.textContent=u.message;again(d,"Retry");return}
+  if(u.state==="available"){
+    const d=bannerBox("upd");const h=document.createElement("b");h.textContent="Update available";d.appendChild(h);
+    if(u.behind){const p=document.createElement("div");p.textContent=u.behind+" new commit(s):";d.appendChild(p);const ul=document.createElement("ul");u.commits.forEach(c=>li(ul,c));d.appendChild(ul)}
+    if(u.images.length){const p=document.createElement("div");p.textContent="Newer container images:";d.appendChild(p);const ul=document.createElement("ul");u.images.forEach(c=>li(ul,c));d.appendChild(ul)}
+    const steps=[];if(u.behind)steps.push("Pull the new version");u.plan.steps.forEach(x=>steps.push(x.text));
+    if(u.images.length){steps.push("Download the newer images");if(!u.plan.steps.some(x=>x.id==="restart"))steps.push("Recreate the containers (interrupts any active sessions)")}
+    const p=document.createElement("div");p.textContent="Updating will:";d.appendChild(p);const ol=document.createElement("ul");steps.forEach(x=>li(ol,x));d.appendChild(ol);
+    u.plan.notes.forEach(n=>{const q=document.createElement("div");q.className="sub";q.textContent="⚠ "+n;d.appendChild(q)});
+    if(u.image_note){const q=document.createElement("div");q.className="sub";q.textContent=u.image_note;d.appendChild(q)}
+    if(u.dirty){const q=document.createElement("div");q.className="bad";q.textContent="This checkout has local changes to tracked files; the pull may refuse to run.";d.appendChild(q)}
     const row=document.createElement("div");row.className="row";
-    const cb=document.createElement("input");cb.type="checkbox";cb.id="u_images";const lb=document.createElement("label");lb.htmlFor="u_images";lb.textContent="Also pull newer container images (they use :latest) and recreate the containers";
-    const go=document.createElement("button");go.className="p";go.textContent="Update and apply";go.onclick=()=>run("update",{apply:true,images:cb.checked});
-    const only=document.createElement("button");only.textContent="Pull only";only.onclick=()=>run("update",{apply:false});
-    row.append(go,only,cb,lb);d.appendChild(row);
+    const go=document.createElement("button");go.className="p";go.textContent="Update";go.onclick=()=>run("update",{});
+    row.appendChild(go);d.appendChild(row);
   }
 }
 async function loadFile(){
@@ -897,7 +972,7 @@ async function folderSet(){
   await api("/api/folder",{folder:$("#folder").value,repo:$("#repo").value});
 }
 async function run(action,extra){
-  try{await folderSet(); $("#out").textContent=""; since=0; setState("running\u2026","");
+  try{await folderSet(); $("#out").textContent=""; $("#jlast").textContent=""; since=0; setState("running\u2026","",true);setOpen(true);
     await api("/api/run",Object.assign({action},extra||{})); poll();
   }catch(e){say("error: "+e.message,"bad")}
 }
@@ -912,7 +987,8 @@ async function poll(){
   }}catch(e){say("error: "+e.message,"bad")}
   polling=false; checkUpdate(false); refresh().catch(()=>{}); loadFile().catch(()=>{}); loadForms().catch(()=>{});
 }
-$("#outclear").onclick=()=>{$("#out").textContent="";setState("","")};
+$("#outbar").onclick=()=>setOpen($("#out").classList.contains("hide"));
+$("#outclear").onclick=e=>{e.stopPropagation();$("#out").textContent="";$("#jlast").textContent="";setState("","")};
 $("#clone").onclick=()=>run("clone",{repo:$("#repo").value});
 $$("button[data-a]").forEach(b=>b.onclick=()=>run(b.dataset.a));
 $("#recheck").onclick=async()=>{try{await folderSet();await refresh();await loadFile();await loadForms();checkUpdate(true)}catch(e){say("error: "+e.message,"bad")}};
@@ -967,9 +1043,10 @@ async function cfgAction(kind){
   const m=$("#cmsg");
   try{await folderSet(); const r=await api("/api/config/"+kind,{data:getCfg()});
     m.className="msg "+(r.ok?"ok":"bad"); m.textContent=(r.ok?"✔ ":"✘ ")+r.message;
-    if(kind==="save"&&r.saved){await loadFile();refresh().catch(()=>{})}
+    if(kind==="save"&&r.saved){await loadFile();refresh().catch(()=>{});$("#c_apply").classList.remove("hide")}
   }catch(e){m.className="msg bad";m.textContent=e.message}
 }
+$$("#prodFields input,#prodFields textarea,#c_domain,#c_life,#c_idle,#c_mode").forEach(e=>e.addEventListener("input",()=>$("#c_apply").classList.add("hide")));
 $("#c_mode").onchange=cfgShow; $("#c_domain").oninput=cfgShow;
 $("#c_validate").onclick=()=>cfgAction("validate"); $("#c_save").onclick=()=>cfgAction("save");
 $("#c_show").onclick=()=>{const i=$("#c_secret");i.type=i.type==="password"?"text":"password";$("#c_show").textContent=i.type==="password"?"Show":"Hide"};
@@ -1009,10 +1086,11 @@ async function tAction(kind){
   const m=$("#tmsg");
   try{await folderSet(); const r=await api("/api/targets/"+kind,{targets:tSerialise()});
     m.className="msg "+(r.ok?"ok":"bad"); m.textContent=(r.ok?"✔ ":"✘ ")+r.message;
-    if(kind==="save"&&r.saved){await loadFile();$("#tstatus").textContent="Saved."}
+    if(kind==="save"&&r.saved){await loadFile();$("#tstatus").textContent="Saved.";$("#t_apply").classList.remove("hide")}
   }catch(e){m.className="msg bad";m.textContent=e.message}
 }
 $$("#tform input,#tform select,#tform textarea").forEach(e=>{e.oninput=tWrite;e.onchange=tWrite});
+$("#tform").addEventListener("input",()=>$("#t_apply").classList.add("hide"));
 $("#t_add").onclick=()=>{targets.push(blank());sel=targets.length-1;tList();tFill();$("#t_name").focus()};
 $("#t_dup").onclick=()=>{if(sel<0)return;const c=JSON.parse(JSON.stringify(targets[sel]));c.name=(c.name||"target")+"-copy";targets.push(c);sel=targets.length-1;tList();tFill()};
 $("#t_del").onclick=()=>{if(sel<0)return;if(!confirm("Delete target \""+(targets[sel].name||"unnamed")+"\"? (Not final until you press Save targets.)"))return;targets.splice(sel,1);sel=Math.min(sel,targets.length-1);tList();tFill()};
