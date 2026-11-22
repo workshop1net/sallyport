@@ -367,7 +367,6 @@ def render_pomerium(c):
         "cookie_expire": c["lifetime"],
         # One session cookie for the main, authenticate. and admin. hosts. By default each host gets its own, so signing
         # out (or switching account) on the main site left the admin site signed in as the previous person.
-        "cookie_domain": c["domain"],
         "jwt_claims_headers": {"X-Pomerium-Claim-Email": "email"},
         "routes": [{
             "from": f"https://{c['domain']}",
@@ -382,6 +381,10 @@ def render_pomerium(c):
     # the signed email against ADMIN_EMAILS, so a non-administrator sees a friendly page that sends them back to the
     # main site instead of Pomerium's bare 403 (Pomerium Core cannot customise that page). Groups cannot be checked
     # by the service, so with groups listed Pomerium keeps enforcing the admin allow-list and shows its own 403.
+    if not dev:
+        # Not in dev: browsers handle cookies scoped to a .localhost name badly, and setting it there put the
+        # sign-in into a redirect loop. Dev keeps one cookie per host.
+        config["cookie_domain"] = c["domain"]
     if admin_emails_only(c):
         admin_policy = policy
     if admin_policy:
