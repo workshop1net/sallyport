@@ -197,6 +197,8 @@ class Handler(BaseHTTPRequestHandler):
     store = None
     public_key = None
     audience = ""
+    admin_emails = set()   # empty: Pomerium alone decides who may enter
+    main_url = ""
 
     def log_message(self, *a):
         pass
@@ -220,6 +222,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def guard(self, post):
         me = self.who()
+        if self.admin_emails and str(me).lower() not in self.admin_emails:
+            raise NotAdmin(me)
         if post:
             origin = self.headers.get("Origin", "")
             if origin != "https://" + self.audience:
@@ -252,6 +256,10 @@ class Handler(BaseHTTPRequestHandler):
                     version, detail = self.store.save(body.get("doc"), body.get("version"), me)
                     return self.send(200, {"ok": True, "message": "saved and applied: " + detail, "version": version})
             return self.send(404, {"error": "not found"})
+        except NotAdmin as e:
+            if post or self.path.split("?")[0] != "/":
+                return self.send(403, {"ok": False, "error": "not an administrator", "message": "not an administrator"})
+            return self.send(403, DENIED_PAGE.replace("__ME__", html_escape(str(e))).replace("__MAIN__", html_escape(self.main_url)), "text/html")
         except Problem as e:
             return self.send(e.code, {"ok": False, "error": str(e), "message": str(e)})
         except (ValueError, KeyError):
@@ -268,6 +276,21 @@ class Handler(BaseHTTPRequestHandler):
         self.handle_request(True)
 
 
+class NotAdmin(Exception):
+    """The caller is signed in and allowed to use Sallyport, but is not an administrator."""
+
+
+def html_escape(text):
+    return (text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;"))
+
+
+DENIED_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Sallyport</title>
+<meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="5;url=__MAIN__">
+<style>body{font:16px/1.5 system-ui,sans-serif;max-width:34em;margin:12vh auto;padding:0 16px;color-scheme:light dark}</style></head>
+<body><h1>Administrators only</h1><p>You are signed in as <b>__ME__</b>, which is not an administrator of this Sallyport.</p>
+<p>Taking you back to <a href="__MAIN__">the main site</a> in a few seconds.</p></body></html>"""
+
+
 def main():
     env = dict(os.environ)
     host = env.get("ADMIN_HOST", "")
@@ -276,6 +299,8 @@ def main():
     Handler.store = Store(env)
     Handler.public_key = load_public_key(env.get("JWT_PUBLIC_KEY", "/app/jwt.pub"))
     Handler.audience = host
+    Handler.admin_emails = {e.strip().lower() for e in env.get("ADMIN_EMAILS", "").split(",") if e.strip()}
+    Handler.main_url = "https://" + (env.get("MAIN_HOST") or host.split(".", 1)[-1]) + "/"
     ThreadingHTTPServer(("0.0.0.0", int(env.get("PORT", "8080"))), Handler).serve_forever()
 
 

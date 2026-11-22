@@ -48,6 +48,8 @@ services:
       DB_USER: sallyport_admin
       DB_PASSWORD: ${ADMIN_DB_PASSWORD:?run ./sallyport init first}
       JWT_PUBLIC_KEY: /app/jwt.pub
+      ADMIN_EMAILS: ${ADMIN_EMAILS:-}
+      MAIN_HOST: ${MAIN_HOST:-}
     volumes:
       - ./generated/admin-jwt.pub:/app/jwt.pub:ro
     depends_on:
