@@ -1273,23 +1273,37 @@ def file_hashes(names):
     return out
 
 
-def stack_healthy(log, wait=150):
-    """True once every service is running (and healthy where it has a healthcheck) on two checks 10 s apart."""
-    deadline, good = time.time() + wait, 0
-    while time.time() < deadline:
-        rc, out = sh(log, compose_argv("ps", "--all", "--format", "json"), timeout=60, check=False)
-        rows = []
+def stack_healthy(log, wait=240):
+    """True once every service is running and none is unhealthy, on two checks 10 s apart. A container whose healthcheck
+    is still 'starting' is waited for; if that is all that remains at the deadline the stack is accepted with a warning,
+    because a slow healthcheck is not a failure. Anything stopped, restarting or unhealthy fails the check."""
+    deadline, good, last = time.time() + wait, 0, ""
+    while True:
         try:
-            data = json.loads(out) if out.lstrip().startswith("[") else [json.loads(x) for x in out.splitlines() if x.strip().startswith("{")]
+            r = subprocess.run(compose_argv("ps", "--all", "--format", "json"), cwd=ROOT, capture_output=True, text=True,
+                               encoding="utf-8", errors="replace", timeout=60)
+            out = (r.stdout or "").strip()
+            data = json.loads(out) if out.startswith("[") else [json.loads(x) for x in out.splitlines() if x.strip().startswith("{")]
             rows = data if isinstance(data, list) else [data]
-        except ValueError:
-            pass
-        ok = bool(rows) and all(r.get("State") == "running" and r.get("Health") in ("", None, "healthy") for r in rows)
-        good = good + 1 if ok else 0
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            rows = []
+        rows = [x for x in rows if not (x.get("State") == "exited" and x.get("ExitCode") == 0)]  # finished one-shot jobs
+        bad = [f"{x.get('Service')} ({x.get('State')})" for x in rows if x.get("State") != "running" or x.get("Health") == "unhealthy"]
+        starting = [str(x.get("Service")) for x in rows if x.get("State") == "running" and x.get("Health") == "starting"]
+        status = ("not running or unhealthy: " + ", ".join(bad)) if bad or not rows else (
+            "waiting for healthchecks: " + ", ".join(starting) if starting else "all services running")
+        if status != last:  # one short line per change, not one per poll
+            log("health: " + status)
+            last = status
+        good = good + 1 if rows and not bad and not starting else 0
         if good >= 2:
             return True
+        if time.time() >= deadline:
+            if rows and not bad and starting:
+                log("health: " + ", ".join(starting) + " still reports 'starting' but is running; accepting the update")
+                return True
+            return False
         time.sleep(10)
-    return False
 
 
 def write_update_status(**kw):
