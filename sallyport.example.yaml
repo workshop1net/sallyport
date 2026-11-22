@@ -48,3 +48,16 @@ access:
 session:
   lifetime: 8h # how long a login lasts before the user must sign in again
   idle_timeout: 30m
+
+# Who may open the admin site (https://admin.<domain>), where systems, people, groups and
+# logins are managed. It has its own allow-list; leave both empty to turn it off.
+# Needs a DNS record for admin.<domain> like the main one.
+admin:
+  emails:
+    - alice@msp.example
+  groups: []
+
+# Optional unattended nightly update. Quote the time: an unquoted 03:00 is a number in some YAML readers.
+# Apply with: ./sallyport schedule apply   (read the README section on the risks first)
+# updates:
+#   schedule: "03:00"

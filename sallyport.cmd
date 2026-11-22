@@ -1,11 +1,11 @@
 @echo off
 rem Runs the Sallyport helper inside Docker, so Python is not needed on the host.
-rem Usage: sallyport.cmd init | load-targets [--dry-run]
+rem Usage: sallyport.cmd init | migrate-db | load-targets [--dry-run] | export-targets
 setlocal
 cd /d "%~dp0"
 
 if "%~1"=="" (
-  echo usage: sallyport.cmd init ^| load-targets
+  echo usage: sallyport.cmd init ^| migrate-db ^| load-targets ^| export-targets
   exit /b 2
 )
 
@@ -33,9 +33,11 @@ if "%~1"=="init" (
   )
 )
 
-rem load-targets needs the stack's internal network, so the stack must be running.
+rem These commands need the stack's internal network, so the stack must be running.
 set NET=
 if "%~1"=="load-targets" set NET=--network sallyport_internal
+if "%~1"=="migrate-db" set NET=--network sallyport_internal
+if "%~1"=="export-targets" set NET=--network sallyport_internal
 
 docker run --rm %NET% -v "%cd%:/work" sallyport-tools %*
 exit /b %errorlevel%

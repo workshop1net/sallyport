@@ -18,6 +18,8 @@ services:
       SHARED_SECRET: ${SHARED_SECRET:?run ./sallyport init first}
       COOKIE_SECRET: ${COOKIE_SECRET:?run ./sallyport init first}
       IDP_CLIENT_SECRET: ${IDP_CLIENT_SECRET:?run ./sallyport init first}
+      # Pomerium signs each user's identity for the admin site with this key.
+      SIGNING_KEY: ${SIGNING_KEY:?run ./sallyport init first}
     volumes:
       - ./generated/pomerium.yaml:/pomerium/config.yaml:ro
       - pomerium-data:/data # ACME account and certificates
@@ -29,6 +31,33 @@ services:
       - no-new-privileges:true
     depends_on:
       - guacamole
+      - admin
+
+  # The admin site (targets editor). Reachable only through Pomerium's admin route, which has its
+  # own allow-list. It verifies Pomerium's signed identity on every request.
+  admin:
+    build:
+      context: .
+      dockerfile: admin/Dockerfile
+    image: sallyport-admin:local
+    restart: unless-stopped
+    environment:
+      ADMIN_HOST: ${ADMIN_HOST:?run ./sallyport init first}
+      DB_HOST: postgres
+      DB_NAME: guacamole_db
+      DB_USER: sallyport_admin
+      DB_PASSWORD: ${ADMIN_DB_PASSWORD:?run ./sallyport init first}
+      JWT_PUBLIC_KEY: /app/jwt.pub
+    volumes:
+      - ./generated/admin-jwt.pub:/app/jwt.pub:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    read_only: true
+    cap_drop: [ALL]
+    networks: [internal]
+    security_opt:
+      - no-new-privileges:true
 
   guacamole:
     image: guacamole/guacamole:latest

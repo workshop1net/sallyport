@@ -4,7 +4,7 @@
 Run:  python sallyport_gui.py [--folder PATH] [--port N] [--no-browser]
 
 It checks that Docker and Git are present, clones or updates the Sallyport
-repository, edits sallyport.yaml and targets.yaml, and starts, restarts or stops the
+repository, edits sallyport.yaml, and starts, restarts or stops the
 stack. All the real work is done by sallyport_core, the same code as the command line.
 
 Security model: the server listens on loopback only, but any web page open in your
@@ -42,7 +42,7 @@ except ImportError:  # sallyport_core already exits with a message; kept for cla
     sys.exit("PyYAML is required: pip install pyyaml")
 
 DEFAULT_REPO = "https://github.com/workshop1net/sallyport.git"
-EDITABLE = {"sallyport.yaml": "sallyport.example.yaml", "targets.yaml": "targets.example.yaml"}
+EDITABLE = {"sallyport.yaml": "sallyport.example.yaml"}
 IDLE_SECONDS = 300  # the page pings every 20 s; a throttled background tab still manages one a minute
 MAX_BODY = 256 * 1024
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -203,7 +203,7 @@ def plan_for(folder, files):
     if initialised(folder) and (init_needed or compose):
         steps.append({"id": "restart", "text": "Recreate the containers (interrupts any active sessions)"})
     if initialised(folder) and core_changed:
-        steps.append({"id": "load_targets", "text": "Reload the targets"})
+        steps.append({"id": "migrate", "text": "Update the database and rebuild the admin site"})
     notes = []
     if any(f.startswith("sql/") for f in files):
         notes.append("Database setup scripts changed. They only run when a database is first created, so an existing "
@@ -302,26 +302,16 @@ def update_status(state, force=False):
 
 
 def action_update(state, job, body):
-    """Pull, then apply what the new files need. Steps that depend on the code just pulled run
-    as fresh processes: this process still has the old code loaded."""
+    """Apply an update. When the stack is set up, `sallyport update` does everything (pull, images, recreate,
+    database migration, health check, rollback) as a fresh process, because this one has the old code loaded."""
     folder = state.folder
-    with state.lock:
-        images_outdated = list(state.update.get("images") or [])
+    me = [sys.executable, "-I", str(folder / "sallyport")]
     rc, files, _ = git(folder, "diff", "--name-only", "HEAD..@{u}")
     plan = plan_for(folder, [f for f in files.splitlines() if f]) if rc == 0 else {"steps": [], "notes": [], "gui_changed": False}
-    if files.strip() and not run_process(job, ["git", "pull", "--ff-only"], folder):
-        return False
-    ids = {st["id"] for st in plan["steps"]}
-    me = [sys.executable, "-I", str(folder / "sallyport")]
-    if "init" in ids and not run_process(job, me + ["init"], folder):
-        return False
-    if images_outdated and initialised(folder) and not run_process(job, compose_cmd(state, "pull"), folder):
-        return False
-    if "restart" in ids or images_outdated:
-        args = ["up", "-d"] + (["--force-recreate"] if "restart" in ids else [])
-        if not run_process(job, compose_cmd(state, *args), folder):
+    if initialised(folder):
+        if not run_process(job, me + ["update"], folder):
             return False
-    if "load_targets" in ids and not run_process(job, me + ["load-targets"], folder):
+    elif files.strip() and not run_process(job, ["git", "pull", "--ff-only"], folder):
         return False
     for note in plan["notes"]:
         job.add("NOTE: " + note)
@@ -365,6 +355,19 @@ def run_core(job, func, *args):
         return False
 
 
+def migrate_when_ready(job, attempts=12):
+    """Create or update the admin tables once the database accepts connections (it can take a while on first start)."""
+    for n in range(attempts):
+        if run_core(job, core.cmd_migrate_db, SimpleNamespace()):
+            return True
+        if n + 1 < attempts:
+            job.add("database not ready yet; trying again in 5 seconds")
+            time.sleep(5)
+    job.add("error: the database setup did not succeed; the stack is running but the admin site has no data yet. "
+            "Press Start to try again.")
+    return False
+
+
 def action_clone_or_pull(state, job, body):
     repo = (body.get("repo") or DEFAULT_REPO).strip()
     if not re.match(r"^(https://|git@)[\w.@:/~-]+$", repo):
@@ -396,8 +399,12 @@ def make_action(name):
             return False
         if not run_core(job, core.cmd_init, SimpleNamespace(no_schema=False, quiet=True)):
             return False
-        if not run_process(job, compose_cmd(state, "up", "-d", "--force-recreate"), state.folder):
+        if not run_process(job, compose_cmd(state, "up", "-d", "--build", "--force-recreate"), state.folder):
             return False
+        if not migrate_when_ready(job):
+            return False
+        if not run_core(job, core.cmd_schedule, SimpleNamespace(action="apply")):
+            job.add("Could not change the scheduled update (see above); everything else was applied.")
         try:
             domain = yaml.safe_load(core.CONFIG.read_text(encoding="utf-8")).get("domain", "")
         except (OSError, yaml.YAMLError, AttributeError):
@@ -406,7 +413,8 @@ def make_action(name):
         return True
 
     def up(state, job, body):
-        return need_checkout(state, job) and run_process(job, compose_cmd(state, "up", "-d"), state.folder)
+        return (need_checkout(state, job) and run_process(job, compose_cmd(state, "up", "-d", "--build"), state.folder)
+                and migrate_when_ready(job))
 
     def restart(state, job, body):
         return need_checkout(state, job) and run_process(
@@ -415,8 +423,8 @@ def make_action(name):
     def down(state, job, body):
         return need_checkout(state, job) and run_process(job, compose_cmd(state, "down"), state.folder)
 
-    def load_targets(state, job, body):
-        return need_checkout(state, job) and run_core(job, core.cmd_load_targets, SimpleNamespace(dry_run=False))
+    def schedule(state, job, body):
+        return need_checkout(state, job) and run_core(job, core.cmd_schedule, SimpleNamespace(action="apply"))
 
     def ps(state, job, body):
         return need_checkout(state, job) and run_process(job, compose_cmd(state, "ps"), state.folder)
@@ -430,12 +438,12 @@ def make_action(name):
         return need_checkout(state, job) and run_process(job, compose_cmd(state, *args), state.folder)
 
     return {"update": action_update, "clone": action_clone_or_pull, "init": init, "apply_settings": apply_settings, "up": up, "restart": restart, "down": down,
-            "load_targets": load_targets, "ps": ps,
+            "schedule": schedule, "ps": ps,
             "logs": logs}.get(name)
 
 
 TITLES = {"update": "Update", "clone": "Clone / update repository", "init": "Initialise", "apply_settings": "Apply settings",
-          "up": "Start", "restart": "Restart", "down": "Stop", "load_targets": "Apply targets",
+          "up": "Start", "restart": "Restart", "down": "Stop", "schedule": "Update schedule",
           "ps": "Status", "logs": "Logs"}
 
 
@@ -482,15 +490,12 @@ def validate_text(name, text):
         if name == "sallyport.yaml":
             c = core.validate_config(data)
             return True, f"valid ({c['mode']} mode, domain {c['domain']})"
-        targets, groups, users = core.load_access(data)
-        for t in targets:
-            core.target_params(t)
-        return True, f"valid ({len(targets)} login(s), {len(groups)} group(s))"
+        return False, "unknown file"
     except SystemExit as e:
         return False, re.sub(r"^error: ", "", str(e.code))
 
 
-# ------------------------------------------------------ structured config and targets
+# ------------------------------------------------------ structured config
 
 class YamlDumper(yaml.SafeDumper):
     pass
@@ -502,6 +507,13 @@ def _represent_str(dumper, data):
 
 
 YamlDumper.add_representer(str, _represent_str)
+
+
+class Quoted(str):
+    """A string always written in double quotes (a bare 03:00 is a number in some YAML readers)."""
+
+
+YamlDumper.add_representer(Quoted, lambda dumper, data: dumper.represent_scalar("tag:yaml.org,2002:str", str(data), style='"'))
 
 
 def dump_yaml(obj, header):
@@ -537,12 +549,19 @@ def build_config_yaml(d):
         if str(d.get("groups_claim") or "").strip():
             access["groups_claim"] = str(d["groups_claim"]).strip()
         out["access"] = access
+    admin = {"emails": as_list(d.get("admin_emails")), "groups": [] if d.get("provider") == "google" else as_list(d.get("admin_groups"))}
+    if admin["emails"] or admin["groups"]:
+        out["admin"] = admin
     out["session"] = session
+    sched = str(d.get("update_time") or "").strip()
+    if sched:
+        out["updates"] = {"schedule": Quoted(sched)}
     return dump_yaml(out, "# Written by the Sallyport GUI. Comments added by hand are not kept when it saves.\n")
 
 
 def flatten_config(data):
     idp, access, session = data.get("idp") or {}, data.get("access") or {}, data.get("session") or {}
+    admin, updates = data.get("admin") or {}, data.get("updates") or {}
     return {"mode": data.get("mode", "production"), "domain": data.get("domain", ""),
             "acme_email": data.get("acme_email", ""), "acme_staging": data.get("acme_staging", True),
             "provider": idp.get("provider", "oidc"), "issuer": idp.get("issuer", ""), "idp_domain": idp.get("domain", ""),
@@ -551,6 +570,8 @@ def flatten_config(data):
             "emails": access.get("emails") or [], "groups": access.get("groups") or [],
             "domains": access.get("domains") or [],
             "groups_claim": access.get("groups_claim", ""),
+            "admin_emails": admin.get("emails") or [], "admin_groups": admin.get("groups") or [],
+            "update_time": str(updates.get("schedule") or ""),
             "lifetime": session.get("lifetime", "8h"), "idle_timeout": session.get("idle_timeout", "30m")}
 
 
@@ -566,43 +587,21 @@ def read_structured(state, name):
     if not isinstance(data, dict):
         return {"exists": True, "data": None, "status": "must contain a YAML mapping"}
     ok, msg = validate_text(name, text)
-    if name == "sallyport.yaml":
-        return {"exists": True, "data": flatten_config(data), "status": msg}
-    if isinstance(data.get("targets"), list):
-        return {"exists": True, "data": core.legacy_to_v2(data["targets"]), "converted": True, "status": msg}
-    return {"exists": True, "converted": False, "status": msg,
-            "data": {k: data.get(k) if isinstance(data.get(k), list) else [] for k in ("systems", "users", "groups", "logins")}}
+    return {"exists": True, "data": flatten_config(data), "status": msg}
 
 
-INT_FIELDS = ("port", "max_sessions")
-
-
-def _clean_rows(rows, keep_empty=()):
-    out = []
-    for t in rows if isinstance(rows, list) else []:
-        if not isinstance(t, dict):
-            continue
-        row = {}
-        for k, v in t.items():
-            if v is None or (v == "" and k not in keep_empty):
-                continue
-            if k in INT_FIELDS and isinstance(v, str) and v.strip().isdigit():
-                v = int(v.strip())
-            row[str(k)] = v
-        out.append(row)
+def schedule_info(state):
+    """Whether a scheduled update is installed, and how the last update went."""
+    out = {"installed": False, "where": "", "last": None, "os": "windows" if os.name == "nt" else "unix"}
+    try:
+        out["installed"], out["where"] = core.schedule_status()
+    except Exception:
+        pass
+    try:
+        out["last"] = json.loads((state.folder / "generated" / "update-status.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        pass
     return out
-
-
-def build_targets_yaml(payload):
-    payload = payload if isinstance(payload, dict) else {}
-    out = {"systems": _clean_rows(payload.get("systems")),
-           "users": [str(u).strip() for u in payload.get("users") or [] if str(u).strip()],
-           "groups": [{"name": g.get("name", ""), "users": [str(u).strip() for u in g.get("users") or [] if str(u).strip()]}
-                      for g in payload.get("groups") or [] if isinstance(g, dict)],
-           "logins": _clean_rows(payload.get("logins"))}
-    header = ("# Written by the Sallyport GUI. Contains credentials in plain text.\n"
-              "# Comments added by hand are not kept when the GUI saves.\n")
-    return dump_yaml(out, header)
 
 
 # ----------------------------------------------------------------------- server
@@ -664,8 +663,10 @@ class Handler(BaseHTTPRequestHandler):
             job = self.state.job
             since = int((q.get("since") or ["0"])[0] or 0)
             return self.reply(200, job.snapshot(since) if job else {"title": "", "lines": [], "next": 0, "done": True, "ok": None})
-        if url.path in ("/api/config", "/api/targets"):
-            return self.reply(200, read_structured(self.state, "sallyport.yaml" if url.path == "/api/config" else "targets.yaml"))
+        if url.path == "/api/config":
+            return self.reply(200, read_structured(self.state, "sallyport.yaml"))
+        if url.path == "/api/schedule":
+            return self.reply(200, schedule_info(self.state))
         if url.path == "/api/file":
             name = (q.get("name") or [""])[0]
             if name not in EDITABLE:
@@ -722,13 +723,12 @@ class Handler(BaseHTTPRequestHandler):
                 core.write_private(self.state.folder / name, text.replace("\r\n", "\n"))
                 return self.reply(200, {"ok": ok, "message": ("saved; " + msg) if ok else ("saved anyway; " + msg), "saved": True})
             return self.reply(200, {"ok": ok, "message": msg})
-        if path in ("/api/config/validate", "/api/config/save", "/api/targets/validate", "/api/targets/save"):
-            is_cfg = path.startswith("/api/config")
-            name = "sallyport.yaml" if is_cfg else "targets.yaml"
-            payload = body.get("data") if is_cfg else body.get("targets")
+        if path in ("/api/config/validate", "/api/config/save"):
+            name = "sallyport.yaml"
+            payload = body.get("data")
             if not isinstance(payload, dict):
                 return self.deny(400, "bad request")
-            text = build_config_yaml(payload) if is_cfg else build_targets_yaml(payload)
+            text = build_config_yaml(payload)
             ok, msg = validate_text(name, text)
             if path.endswith("/save"):
                 if not ok:
@@ -843,7 +843,7 @@ details summary{cursor:pointer;margin-bottom:8px}
 </style></head><body>
 <h1>Sallyport</h1><div class="sub">Local control panel &mdash; listening on 127.0.0.1 only. <button id="quit">Quit</button></div>
 
-<div class="maintabs"><button id="tb_settings" data-t="settings" class="on">Settings &amp; system</button><button id="tb_targets" data-t="targets">Targets</button><button id="tb_raw" data-t="raw">Raw files</button></div>
+<div class="maintabs"><button id="tb_settings" data-t="settings" class="on">Settings &amp; system</button><button id="tb_raw" data-t="raw">Raw files</button></div>
 
 <div id="tab_settings" class="tabpanel">
 <div id="banner"></div>
@@ -878,72 +878,39 @@ details summary{cursor:pointer;margin-bottom:8px}
 <label class="p_groups" for="c_claim">Groups claim</label><input class="p_groups" type="text" id="c_claim" placeholder="groups">
 </div>
 <div id="idpOpen" class="banner upd hide"></div>
+<div class="grid">
+<label for="c_aemails">Admin site: emails</label><textarea id="c_aemails" class="small" placeholder="one per line: who may open the admin site"></textarea>
+<label class="p_groups" for="c_agroups">Admin site: groups</label><textarea id="c_agroups" class="small p_groups" placeholder="one group ID per line (optional)"></textarea>
+</div>
+<div class="sub">The admin site (<code>admin.&lt;your domain&gt;</code>) is where systems, people, groups and logins are managed. It is reached through the same login as everything else but has its own allow-list: only the accounts listed here. Leave both empty to turn it off. It needs a DNS record for <code>admin.&lt;your domain&gt;</code> pointing at this server, like the main one.</div>
 <details id="idpHelp" open><summary><b>How to set this up with your identity provider</b></summary><div id="helpBody" class="sub"></div>
 <div id="actionBox" class="hide"><div class="sub">Auth0 login Action for groups (Actions &rarr; Library &rarr; Create Action &rarr; Login / Post Login; deploy it, then add it to the Login flow):</div>
 <textarea id="actionCode" class="small" readonly spellcheck="false"></textarea><div class="row"><button type="button" id="actionCopy">Copy</button></div></div></details></div>
-<div id="devNote" class="sub" style="display:none">Dev mode signs you in as <code>kilgore@kilgore.trout</code> with a throwaway login. Domain must end in <code>.localhost</code>.</div>
+<div id="devNote" class="sub" style="display:none">Dev mode offers four throwaway logins (password <code>password</code>): <code>kilgore@kilgore.trout</code> (the administrator, who can open the admin site), <code>billy.pilgrim@</code>, <code>eliot.rosewater@</code> and <code>montana.wildhack@kilgore.trout</code>. To switch identity, sign out (or use a private window) and sign in as another. Domain must end in <code>.localhost</code>.</div>
 <div class="grid">
 <label for="c_life">Session lifetime</label><input type="text" id="c_life" placeholder="8h">
 <label for="c_idle">Idle timeout</label><input type="text" id="c_idle" placeholder="30m">
+<label for="c_upd">Automatic update time</label><input type="text" id="c_upd" placeholder="03:00 (24-hour, this computer's time; empty = off)">
 </div>
+<div class="sub" id="updInfo"></div>
 <div class="row"><button id="c_validate">Validate</button><button id="c_save" class="p">Save settings</button><span id="cmsg" class="msg"></span><button id="c_apply" class="p hide" data-a="apply_settings">Apply settings and start now</button></div>
 <div class="warn">The client secret is stored in plain text in sallyport.yaml. Saving changes nothing in the running system until you apply the settings (see Operate below).</div></section>
 
 <section><h2>Operate</h2>
-<div class="sub">New install: save your settings, press <b>Apply settings and start</b>, then switch to the Targets tab.</div>
+<div class="sub">New install: save your settings, press <b>Apply settings and start</b>, then open the admin site (<code>https://admin.&lt;your domain&gt;</code>) to add systems, people and logins.</div>
 <div class="card"><h3>Apply settings</h3>
-<div class="sub">Use this the first time, and every time you change <b>Settings</b> above (domain, identity provider, who may log in, session lengths). It regenerates the generated configuration from <code>sallyport.yaml</code> and secrets, then (re)starts the stack, which ends any sessions in progress. Changing targets does not need this.</div>
+<div class="sub">Use this the first time, and every time you change <b>Settings</b> above (domain, identity provider, who may log in, session lengths). It regenerates the generated configuration from <code>sallyport.yaml</code> and secrets, then (re)starts the stack, which ends any sessions in progress. Targets are managed in the admin site and do not need this.</div>
 <div class="row"><button data-a="apply_settings" class="p">Apply settings and start</button></div></div>
 <div class="card"><h3>Stack</h3>
 <div class="sub">Day-to-day controls. Start and Stop leave your data alone. Restart recreates every container and ends sessions in progress.</div>
-<div class="row"><button data-a="up">Start</button><button data-a="down">Stop</button><button data-a="restart">Restart</button><button data-a="ps">Show status</button><button data-a="logs">Show recent logs</button></div></div>
+<div class="row"><button data-a="up">Start</button><button data-a="down">Stop</button><button data-a="restart">Restart</button><button data-a="ps">Show status</button><button data-a="logs">Show recent logs</button></div>
+<div class="sub">The update schedule is saved with your settings and installed when you apply them. To change only the schedule, save the settings and press: <button data-a="schedule">Install or remove the update schedule</button></div></div>
 </section>
-</div>
-
-<div id="tab_targets" class="tabpanel hide">
-<section><h2>Targets</h2>
-<div class="sub" id="tstatus"></div>
-<div id="openwarn" class="banner bad hide"></div>
-<div id="sharedinfo" class="banner upd hide"></div>
-<div class="sub">Three lists. <b>Systems</b> are the machines people can connect to. <b>People &amp; groups</b> are the people you give access to, and named groups of them. <b>Logins</b> say who may use which system, and with which credentials (saved, or asked for when they connect). Someone who passes the identity provider but has no login of their own sees only the logins marked Everyone.</div>
-<div class="subtabs"><button data-s="systems" class="on">Systems</button><button data-s="people">People &amp; groups</button><button data-s="logins">Logins</button></div>
-<div id="st_systems" class="subpanel"><div class="targets">
-<div><div id="tlist" class="tlist"></div>
-<div class="row"><button id="t_add">Add system</button><button id="t_del">Delete system</button></div></div>
-<div id="tform"><div class="grid">
-<label for="t_name">Name</label><input type="text" id="t_name">
-<label for="t_protocol">Protocol</label><select id="t_protocol"><option>rdp</option><option>ssh</option></select>
-<label for="t_host">Host</label><input type="text" id="t_host" placeholder="10.0.0.10 or server.corp">
-<label for="t_port">Port</label><input type="text" id="t_port" placeholder="default for the protocol">
-<label class="rdp" for="t_security">RDP security</label><select class="rdp" id="t_security"><option>nla</option><option>tls</option><option>rdp</option><option>any</option></select>
-<label class="rdp" for="t_ignore_cert">Skip certificate check</label><span class="rdp"><input type="checkbox" id="t_ignore_cert"> <span class="sub">allows interception between guacd and the target</span></span>
-<label class="ssh" for="t_host_key">Host key</label><input class="ssh" type="text" id="t_host_key" placeholder="ssh-ed25519 AAAA... (strongly recommended)">
-<label for="t_clipboard">Clipboard</label><select id="t_clipboard"><option value="both">both ways</option><option value="none">none</option><option value="paste-only">paste only (you to target)</option><option value="copy-only">copy only (target to you)</option></select>
-<label for="t_max_sessions">Max sessions</label><input type="text" id="t_max_sessions" placeholder="1">
-</div><div class="sub" id="t_sysinfo"></div></div></div></div>
-<div id="st_people" class="subpanel hide">
-<h3>People</h3>
-<div class="sub">People you give logins to or put in groups. This is not the list of who may log in at all; that is under Settings.</div>
-<div id="ulist"></div>
-<div class="row"><input type="text" id="u_new" placeholder="person@example.com" list="knownUsers"><button id="u_add">Add person</button><datalist id="knownUsers"></datalist></div>
-<h3>Groups</h3>
-<div class="sub">A group is a named list of people. Use it to decide who sees a login, for example who sees the firewall.</div>
-<div id="glist"></div>
-<div class="row"><button id="g_add">Add group</button></div></div>
-<div id="st_logins" class="subpanel hide">
-<div class="row"><label for="l_filter">Show</label><select id="l_filter"></select><button id="l_add" class="p">Add login</button></div>
-<div id="llist"></div></div>
-<div class="row"><button id="t_validate">Validate</button><button id="t_save" class="p">Save targets</button><span id="tmsg" class="msg"></span><button id="t_apply" class="p hide" data-a="load_targets">Apply targets now</button></div>
-<div class="warn">Saved credentials are stored in plain text in targets.yaml and in the database. Use dedicated, least-privilege accounts, ideally one per person so the target's own logs show who did what. File transfer and printing are always off. Saving changes nothing in the running system until you apply the targets (below). Each login becomes a separate connection named like <code>System (person@example.com)</code>, so <b>Max sessions</b> applies to each connection separately.</div></section>
-
-<section><h2>Apply targets</h2>
-<div class="sub">Use this after you change targets above, and once after the first start. It copies <code>targets.yaml</code> into Guacamole, adding, changing and removing connections to match. No restart; sessions already open are not affected. The stack must be running.</div>
-<div class="row"><button data-a="load_targets" class="p">Apply targets</button></div></section>
 </div>
 
 <div id="tab_raw" class="tabpanel hide">
 <section><h2>Raw YAML files</h2><div class="sub">For anything the forms do not cover. Saving here replaces the whole file as written.</div>
-<div class="tabs row"><button data-f="sallyport.yaml" class="on">sallyport.yaml</button><button data-f="targets.yaml">targets.yaml</button><span id="fstate" class="sub"></span></div>
+<div class="tabs row"><button data-f="sallyport.yaml" class="on">sallyport.yaml</button><span id="fstate" class="sub"></span></div>
 <textarea id="editor" spellcheck="false"></textarea>
 <div class="row"><button id="validate">Validate</button><button id="save">Save</button><span id="fmsg" class="msg"></span></div></section>
 </div>
@@ -1070,7 +1037,7 @@ $("#validate").onclick=()=>fileAction("validate"); $("#save").onclick=()=>fileAc
 $("#quit").onclick=async()=>{try{await api("/api/quit",{})}catch(e){} document.body.textContent="Stopped. You can close this tab."};
 
 /* ---- settings form ---- */
-const CF={mode:"c_mode",domain:"c_domain",acme_email:"c_acme_email",provider:"c_provider",issuer:"c_issuer",idp_domain:"c_idp_domain",client_id:"c_client_id",client_secret:"c_secret",groups_claim:"c_claim",lifetime:"c_life",idle_timeout:"c_idle"};
+const CF={mode:"c_mode",domain:"c_domain",acme_email:"c_acme_email",provider:"c_provider",issuer:"c_issuer",idp_domain:"c_idp_domain",client_id:"c_client_id",client_secret:"c_secret",groups_claim:"c_claim",lifetime:"c_life",idle_timeout:"c_idle",update_time:"c_upd"};
 const lines=v=>(v||"").split(/\r?\n/).map(x=>x.trim()).filter(Boolean);
 const ACTION_CODE="exports.onExecutePostLogin = async (event, api) => {\n  if (event.authorization) {\n    api.idToken.setCustomClaim('pomerium.io/groups', event.authorization.roles);\n  }\n};\n";
 function helpList(items){const ol=document.createElement("ol");items.forEach(t=>{const l=document.createElement("li");l.textContent=t;ol.appendChild(l)});return ol}
@@ -1114,6 +1081,7 @@ function getCfg(){
   d.acme_staging=$("#c_staging").checked;
   d.scopes=($("#c_scopes").value.split(/[\s,]+/)).filter(Boolean);
   d.emails=lines($("#c_emails").value); d.groups=lines($("#c_groups").value); d.domains=lines($("#c_domains").value);
+  d.admin_emails=lines($("#c_aemails").value); d.admin_groups=lines($("#c_agroups").value);
   return d;
 }
 function setCfg(d){
@@ -1122,6 +1090,7 @@ function setCfg(d){
   $("#c_staging").checked=d.acme_staging!==false;
   $("#c_scopes").value=(d.scopes||[]).join(" ");
   $("#c_emails").value=(d.emails||[]).join("\n"); $("#c_groups").value=(d.groups||[]).join("\n"); $("#c_domains").value=(d.domains||[]).join("\n");
+  $("#c_aemails").value=(d.admin_emails||[]).join("\n"); $("#c_agroups").value=(d.admin_groups||[]).join("\n");
   cfgShow();
 }
 async function loadCfg(){
@@ -1136,218 +1105,21 @@ async function cfgAction(kind){
     if(kind==="save"&&r.saved){await loadFile();refresh().catch(()=>{});$("#c_apply").classList.remove("hide")}
   }catch(e){m.className="msg bad";m.textContent=e.message}
 }
-$$("#prodFields input,#prodFields textarea,#prodFields select,#c_domain,#c_life,#c_idle,#c_mode").forEach(e=>e.addEventListener("input",()=>$("#c_apply").classList.add("hide")));
+$$("#prodFields input,#prodFields textarea,#prodFields select,#c_domain,#c_life,#c_idle,#c_upd,#c_aemails,#c_agroups,#c_mode").forEach(e=>e.addEventListener("input",()=>$("#c_apply").classList.add("hide")));
 ["c_emails","c_groups","c_domains","c_issuer"].forEach(i=>$("#"+i).addEventListener("input",cfgShow)); $("#c_mode").onchange=cfgShow; $("#c_domain").oninput=cfgShow; $("#c_provider").onchange=cfgShow;
 $("#actionCopy").onclick=async()=>{const t=$("#actionCode");try{await navigator.clipboard.writeText(t.value)}catch(e){t.select();document.execCommand("copy")}$("#actionCopy").textContent="Copied";setTimeout(()=>$("#actionCopy").textContent="Copy",1500)};
 $("#c_validate").onclick=()=>cfgAction("validate"); $("#c_save").onclick=()=>cfgAction("save");
 $("#c_show").onclick=()=>{const i=$("#c_secret");i.type=i.type==="password"?"text":"password";$("#c_show").textContent=i.type==="password"?"Show":"Hide"};
 
-/* ---- targets: systems, people & groups, logins ---- */
-const SYS=["name","protocol","host","port","security","host_key","clipboard","max_sessions"];
-let systems=[], users=[], groups=[], logins=[], sel=-1, cfgUsers={emails:[],groups:[],domains:[]};
-const blankSys=()=>({name:"",protocol:"rdp",host:"",port:"",security:"nla",ignore_cert:false,host_key:"",clipboard:"both",max_sessions:1});
-const blankLogin=()=>({who:"user",user:"",grp:null,sys:null,cred:"ask",username:"",password:"",domain:"",private_key:"",passphrase:""});
-const CREDK=["username","password","domain","private_key","passphrase"];
-const lc=x=>String(x||"").trim().toLowerCase();
-function fromFile(d){
-  systems=(d.systems||[]).map(e=>Object.assign(blankSys(),e,{port:e.port??"",host_key:e.host_key||"",ignore_cert:!!e.ignore_cert,max_sessions:e.max_sessions??1}));
-  users=(d.users||[]).map(lc); groups=(d.groups||[]).map(g=>({name:g.name||"",users:(g.users||[]).map(lc)}));
-  logins=(d.logins||[]).map(l=>{const o=blankLogin(); o.sys=systems.find(s=>s.name===l.system)||null;
-    if(l.everyone)o.who="all"; else if(l.group!==undefined){o.who="group";o.grp=groups.find(g=>g.name===l.group)||null} else o.user=lc(l.user);
-    for(const k of CREDK)o[k]=l[k]||"";
-    o.cred=(o.username||o.password||o.private_key||o.passphrase)?"saved":"ask"; return o;});
+async function loadSched(){
+  const r=await api("/api/schedule"), box=$("#updInfo"); box.textContent="";
+  const add=t=>{const d=document.createElement("div");d.textContent=t;box.appendChild(d)};
+  add(r.installed?"Scheduled update installed ("+r.where+").":"No scheduled update is installed on this computer.");
+  if(r.last)add("Last update: "+r.last.at+", "+(r.last.ok?"ok":"FAILED")+" - "+r.last.summary+(r.last.rolled_back?" (rolled back)":""));
+  if(r.os==="windows")add("On Windows the task runs only while you are signed in and Docker Desktop is running, so for unattended use prefer a Linux server.");
+  add("Unattended updates install whatever the repository's main branch and the container images' latest tags contain at that time, then roll back automatically if the stack is not healthy afterwards. See the README.");
 }
-function sysProps(s){
-  const o={protocol:s.protocol,host:s.host};
-  if(String(s.port).trim()!=="")o.port=s.port;
-  if(s.protocol==="rdp"){o.security=s.security;o.ignore_cert=!!s.ignore_cert}
-  else if(s.host_key)o.host_key=s.host_key;
-  o.clipboard=s.clipboard; if(String(s.max_sessions).trim()!=="")o.max_sessions=s.max_sessions;
-  return o;
-}
-function allUsers(){return [...new Set(users.concat(groups.flatMap(g=>g.users),logins.filter(l=>l.who==="user").map(l=>l.user)).map(lc).filter(Boolean))].sort()}
-function toFile(){
-  const seen=new Set();
-  for(const s of systems){const n=s.name.trim(); if(!n)throw new Error("A system has no name."); if(seen.has(n))throw new Error("Two systems are called '"+n+"'."); seen.add(n)}
-  const gseen=new Set();
-  for(const g of groups){const n=g.name.trim(); if(!n)throw new Error("A group has no name."); if(gseen.has(n))throw new Error("Two groups are called '"+n+"'."); gseen.add(n)}
-  const out=[];
-  for(const l of logins){
-    if(!l.sys)throw new Error("A login has no system chosen.");
-    const o={system:l.sys.name.trim()};
-    if(l.who==="all")o.everyone=true;
-    else if(l.who==="group"){if(!l.grp)throw new Error("A login for '"+o.system+"' has no group chosen."); o.group=l.grp.name.trim()}
-    else{const em=lc(l.user); if(!em)throw new Error("A login for '"+o.system+"' has no person. Enter an email address, or choose a group or Everyone."); o.user=em}
-    if(l.cred==="saved"){
-      for(const k of ["username","password"])if(l[k]!=="")o[k]=l[k];
-      if(l.sys.protocol==="rdp"){if(l.domain)o.domain=l.domain}
-      else{if(l.private_key)o.private_key=l.private_key; if(l.passphrase)o.passphrase=l.passphrase}
-    }
-    out.push(o);
-  }
-  return {systems:systems.map(s=>Object.assign({name:s.name.trim()},sysProps(s))), users:allUsers(),
-    groups:groups.map(g=>({name:g.name.trim(),users:g.users.map(lc).filter(Boolean)})), logins:out};
-}
-const hasSaved=l=>l.cred==="saved"&&!!(l.username||l.password||l.private_key||l.passphrase);
-const openLogin=l=>l.who==="all"&&hasSaved(l);
-const isOpen=s=>logins.some(l=>l.sys===s&&openLogin(l));
-const isShared=s=>logins.some(l=>l.sys===s&&l.who==="all"&&!hasSaved(l));
-function userHint(em){
-  em=lc(em); if(!em||cfgUsers.groups.length||cfgUsers.domains.length||!cfgUsers.emails.length)return "";
-  return cfgUsers.emails.includes(em)?"":"⚠ Not in Allowed emails (Settings tab), so this person cannot log in yet.";
-}
-function el(tag,cls,text){const e=document.createElement(tag);if(cls)e.className=cls;if(text!==undefined)e.textContent=text;return e}
-function addRow(grid,label,node){grid.appendChild(el("label","",label));grid.appendChild(node);return node}
-function objSelect(items,cur,label,onset){const s=el("select");let o=el("option","","— choose —");o.value="-1";s.appendChild(o);
-  items.forEach((x,i)=>{o=el("option","",label(x)||"(unnamed)");o.value=String(i);s.appendChild(o)});
-  s.value=String(items.indexOf(cur)); if(s.value==="")s.value="-1"; s.onchange=()=>{onset(items[+s.value]||null)}; return s}
-function valSelect(l,k,opts,after){const s=el("select");for(const [v,t] of opts){const o=el("option","",t);o.value=v;s.appendChild(o)}s.value=l[k];s.onchange=()=>{l[k]=s.value;after()};return s}
-function inp(l,k,type,ph,onflip){const i=el("input");i.type=type||"text";i.autocomplete="off";i.value=l[k];if(ph)i.placeholder=ph;
-  i.oninput=()=>{const was=hasSaved(l);l[k]=i.value;if(onflip&&was!==hasSaved(l))onflip()};return i}
-function refreshFlags(){
-  const open=[...new Set(systems.filter(isOpen).map(s=>s.name||"(unnamed)"))];
-  const shared=[...new Set(systems.filter(s=>isShared(s)&&!isOpen(s)).map(s=>s.name||"(unnamed)"))];
-  const gs=[...new Set(logins.filter(l=>l.who==="group"&&hasSaved(l)&&l.sys).map(l=>l.sys.name+" ("+(l.grp?l.grp.name:"?")+")"))];
-  const w=$("#openwarn"), lines=[];
-  if(open.length)lines.push("⚠ Saved credentials open to everyone who can log in: "+open.join(", ")+". Anyone you add to your identity provider later gets use of these credentials automatically.");
-  w.classList.toggle("hide",!lines.length); w.textContent=lines.join(" ");
-  const n=$("#sharedinfo"), info=[];
-  if(shared.length)info.push("ⓘ Visible to everyone who can log in, but each person supplies their own credentials: "+shared.join(", ")+". Anyone you add later will see these.");
-  if(gs.length)info.push("ⓘ Saved credentials shared by every member of a group, so the target's own logs cannot tell them apart: "+gs.join(", ")+".");
-  n.classList.toggle("hide",!info.length); n.textContent=info.join(" ");
-}
-function showSub(n){
-  $$(".subtabs button").forEach(b=>b.classList.toggle("on",b.dataset.s===n));
-  for(const k of ["systems","people","logins"])$("#st_"+k).classList.toggle("hide",k!==n);
-  if(n==="people")renderPeople(); if(n==="logins")renderLogins(); if(n==="systems")tList();
-}
-$$(".subtabs button").forEach(b=>b.onclick=()=>showSub(b.dataset.s));
-function fillKnown(){const dl=$("#knownUsers");dl.textContent="";new Set(allUsers().concat(cfgUsers.emails)).forEach(u=>{const o=el("option");o.value=u;dl.appendChild(o)})}
-/* systems */
-function tShowFields(){const p=$("#t_protocol").value;
-  $$("#tform .rdp").forEach(e=>e.classList.toggle("hide",p!=="rdp")); $$("#tform .ssh").forEach(e=>e.classList.toggle("hide",p!=="ssh"));}
-function tFill(){
-  const t=systems[sel]; $("#tform").classList.toggle("hide",!t); if(!t)return;
-  for(const k of SYS)$("#t_"+k).value=t[k]??""; $("#t_ignore_cert").checked=!!t.ignore_cert; tShowFields();
-  const n=logins.filter(l=>l.sys===t).length; $("#t_sysinfo").textContent=n+" login(s) use this system. Add or change them on the Logins tab.";
-}
-function tWrite(){
-  const t=systems[sel]; if(!t)return;
-  for(const k of SYS)t[k]=$("#t_"+k).value; t.ignore_cert=$("#t_ignore_cert").checked; tShowFields(); tList();
-}
-function tList(){
-  const box=$("#tlist"); box.textContent="";
-  systems.forEach((t,i)=>{const d=el("div",i===sel?"on":"",(isOpen(t)?"⚠ ":isShared(t)?"ⓘ ":"")+(t.name||"(unnamed)"));
-    const s=el("small","",t.protocol+" "+(t.host||"")+" · "+logins.filter(l=>l.sys===t).length+" login(s)"); d.appendChild(s);
-    d.onclick=()=>{sel=i;tList();tFill()}; box.appendChild(d);});
-  refreshFlags();
-}
-/* people and groups */
-function renderPeople(){
-  const ul=$("#ulist"); ul.textContent=""; fillKnown();
-  const all=allUsers(); if(!all.length)ul.appendChild(el("div","sub","No people yet."));
-  all.forEach(u=>{
-    const r=el("div","urow"); r.appendChild(el("b","",u));
-    const gn=groups.filter(g=>g.users.map(lc).includes(u)).map(g=>g.name||"(unnamed)");
-    const n=logins.filter(l=>l.who==="user"&&lc(l.user)===u).length;
-    r.appendChild(el("span","sub","groups: "+(gn.join(", ")||"none")+" · "+n+" login(s)"));
-    const h=userHint(u); if(h)r.appendChild(el("span","hint",h));
-    const add=el("button","","Add login"); add.onclick=()=>{const l=blankLogin();l.user=u;logins.push(l);showSub("logins");$("#l_filter").value="u:"+u;renderLogins()};
-    const rm=el("button","","Remove");
-    rm.onclick=()=>{if(!confirm("Remove "+u+", their group memberships and their "+n+" login(s)? (Not final until you press Save targets.)"))return;
-      users=users.filter(x=>lc(x)!==u); groups.forEach(g=>{g.users=g.users.filter(x=>lc(x)!==u)}); logins=logins.filter(l=>!(l.who==="user"&&lc(l.user)===u)); renderPeople();refreshFlags()};
-    r.appendChild(add); r.appendChild(rm); ul.appendChild(r);
-  });
-  const gl=$("#glist"); gl.textContent=""; if(!groups.length)gl.appendChild(el("div","sub","No groups yet."));
-  groups.forEach(g=>{
-    const card=el("div","acc"), grid=el("div","grid");
-    const nm=el("input");nm.type="text";nm.value=g.name;nm.placeholder="group name";nm.oninput=()=>{g.name=nm.value};
-    const ta=el("textarea","small");ta.spellcheck=false;ta.value=g.users.join("\n");ta.placeholder="one email per line";
-    ta.oninput=()=>{g.users=ta.value.split(/\n/).map(lc).filter(Boolean)}; ta.onchange=()=>renderPeople();
-    addRow(grid,"Group name",nm); addRow(grid,"Members",ta); card.appendChild(grid);
-    const n=logins.filter(l=>l.grp===g).length, rm=el("button","","Remove group");
-    rm.onclick=()=>{if(!confirm("Remove group "+(g.name||"(unnamed)")+" and its "+n+" login(s)? (Not final until you press Save targets.)"))return;
-      groups=groups.filter(x=>x!==g); logins=logins.filter(l=>l.grp!==g); renderPeople();refreshFlags()};
-    const r=el("div","row");r.appendChild(rm);card.appendChild(r); gl.appendChild(card);
-  });
-}
-$("#u_add").onclick=()=>{const v=lc($("#u_new").value); if(!v)return; if(!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(v)){alert("That is not an email address.");return}
-  if(!users.includes(v))users.push(v); $("#u_new").value=""; renderPeople()};
-$("#g_add").onclick=()=>{groups.push({name:"",users:[]});renderPeople();const i=$$("#glist input");if(i.length)i[i.length-1].focus()};
-/* logins */
-function fillFilter(){
-  const f=$("#l_filter"), cur=f.value; f.textContent="";
-  const add=(v,t)=>{const o=el("option","",t);o.value=v;f.appendChild(o)};
-  add("all","All logins"); add("everyone","Everyone logins");
-  allUsers().forEach(u=>add("u:"+u,"Person: "+u)); groups.forEach(g=>add("g:"+g.name,"Group: "+(g.name||"(unnamed)"))); systems.forEach(s=>add("s:"+s.name,"System: "+(s.name||"(unnamed)")));
-  f.value=cur; if(f.value!==cur)f.value="all";
-}
-function matches(l,f){
-  if(!f||f==="all")return true; if(f==="everyone")return l.who==="all";
-  const v=f.slice(2); if(f.startsWith("u:"))return l.who==="user"&&lc(l.user)===v;
-  if(f.startsWith("g:"))return l.who==="group"&&!!l.grp&&l.grp.name===v; if(f.startsWith("s:"))return !!l.sys&&l.sys.name===v; return true;
-}
-function loginCard(l){
-  const card=el("div","acc"), g=el("div","grid"), hint=el("div","hint");
-  const upd=()=>{const open=openLogin(l); card.className="acc"+(open?" open":"");
-    hint.className="hint"+(open?"":" info");
-    hint.textContent=l.who==="all"?(hasSaved(l)?"⚠ Everyone who can log in can use these saved credentials, including anyone you add later.":"ⓘ Everyone who can log in sees this system, including anyone you add later. They must enter their own credentials.")
-      :l.who==="group"?(hasSaved(l)?"ⓘ Every member of the group shares these saved credentials, so the target's own logs cannot tell them apart.":"")
-      :userHint(l.user); hint.style.display=hint.textContent?"":"none";};
-  const redo=()=>{renderLogins();refreshFlags()};
-  addRow(g,"Who",valSelect(l,"who",[["user","One person"],["group","A group"],["all","Everyone who can log in"]],redo));
-  if(l.who==="user"){const em=inp(l,"user","text","person@example.com"); em.setAttribute("list","knownUsers"); const base=em.oninput;
-    em.oninput=()=>{base();upd()}; em.onchange=()=>{fillKnown();refreshFlags()}; addRow(g,"Person",em)}
-  if(l.who==="group")addRow(g,"Group",objSelect(groups,l.grp,x=>x.name,x=>{l.grp=x;refreshFlags()}));
-  addRow(g,"System",objSelect(systems,l.sys,x=>x.name,x=>{l.sys=x;redo()}));
-  addRow(g,"Credentials",valSelect(l,"cred",[["ask","Ask them when they connect"],["saved","Use saved credentials"]],redo));
-  if(l.cred==="saved"){
-    const flip=()=>{upd();refreshFlags();tList()};
-    addRow(g,"Username",inp(l,"username","text","",flip)); addRow(g,"Password",inp(l,"password","password","",flip));
-    if(!l.sys||l.sys.protocol==="rdp")addRow(g,"Windows domain",inp(l,"domain","text","optional",flip));
-    if(l.sys&&l.sys.protocol==="ssh"){const ta=el("textarea","small");ta.spellcheck=false;ta.value=l.private_key;ta.placeholder="-----BEGIN OPENSSH PRIVATE KEY----- (optional)";
-      ta.oninput=()=>{const was=hasSaved(l);l.private_key=ta.value;if(was!==hasSaved(l))flip()}; addRow(g,"Private key",ta); addRow(g,"Key passphrase",inp(l,"passphrase","password","",flip))}
-  }
-  card.appendChild(g); card.appendChild(hint);
-  const rm=el("button","","Remove login"); rm.onclick=()=>{logins=logins.filter(x=>x!==l);redo()}; const r=el("div","row");r.appendChild(rm);card.appendChild(r);
-  upd(); return card;
-}
-function renderLogins(){
-  fillFilter(); fillKnown(); const box=$("#llist"); box.textContent=""; const f=$("#l_filter").value;
-  const shown=logins.filter(l=>matches(l,f));
-  if(!shown.length)box.appendChild(el("div","sub",logins.length?"No logins match this filter.":(systems.length?"No logins yet. Nobody can connect to anything until you add one.":"Add a system first (Systems tab), then give people logins here.")));
-  shown.forEach(l=>box.appendChild(loginCard(l)));
-}
-$("#l_filter").onchange=renderLogins;
-$("#l_add").onclick=()=>{const l=blankLogin(), f=$("#l_filter").value;
-  if(f==="everyone")l.who="all"; else if(f.startsWith("u:"))l.user=f.slice(2); else if(f.startsWith("g:")){l.who="group";l.grp=groups.find(g=>g.name===f.slice(2))||null}
-  else if(f.startsWith("s:"))l.sys=systems.find(s=>s.name===f.slice(2))||null;
-  if(!l.sys&&systems.length===1)l.sys=systems[0];
-  logins.push(l); renderLogins(); refreshFlags(); tList()};
-async function loadTargets(){
-  const r=await api("/api/targets"); fromFile(r.data||{}); sel=systems.length?0:-1;
-  try{const c=await api("/api/config"); const d=c.data||{};
-    cfgUsers={emails:(d.emails||[]).map(lc),groups:d.groups||[],domains:d.domains||[]}}catch(e){}
-  tList(); tFill();
-  $("#tstatus").textContent=!r.exists?"No targets.yaml yet. Add a system, then a login, and save.":
-    (r.converted?"This file uses the older flat format; it is shown converted and will be saved in the new format. ":"Current file: ")+r.status;
-}
-async function tAction(kind){
-  const m=$("#tmsg");
-  try{const targets=toFile(); await folderSet(); const r=await api("/api/targets/"+kind,{targets});
-    m.className="msg "+(r.ok?"ok":"bad"); m.textContent=(r.ok?"✔ ":"✘ ")+r.message;
-    if(kind==="save"&&r.saved){await loadFile();$("#tstatus").textContent="Saved.";$("#t_apply").classList.remove("hide")}
-  }catch(e){m.className="msg bad";m.textContent="✘ "+e.message}
-}
-$$("#tform .grid input,#tform .grid select").forEach(e=>{e.oninput=tWrite;e.onchange=tWrite});
-$("#tform").addEventListener("input",()=>$("#t_apply").classList.add("hide"));
-["st_people","st_logins"].forEach(i=>$("#"+i).addEventListener("input",()=>$("#t_apply").classList.add("hide")));
-$("#t_add").onclick=()=>{systems.push(blankSys());sel=systems.length-1;tList();tFill();$("#t_name").focus()};
-$("#t_del").onclick=()=>{if(sel<0)return;const s=systems[sel],n=logins.filter(l=>l.sys===s).length;
-  if(!confirm("Delete system \""+(s.name||"unnamed")+"\" and its "+n+" login(s)? (Not final until you press Save targets.)"))return;
-  logins=logins.filter(l=>l.sys!==s); systems.splice(sel,1); sel=Math.min(sel,systems.length-1); tList(); tFill()};
-$("#t_validate").onclick=()=>tAction("validate"); $("#t_save").onclick=()=>tAction("save");
-async function loadForms(){await loadCfg();await loadTargets()}
+async function loadForms(){await loadCfg();await loadSched()}
 
 setInterval(()=>api("/api/ping").catch(()=>{}),20000);
 refresh().then(()=>checkUpdate(false)).then(loadFile).then(loadForms).catch(e=>{document.body.textContent="Cannot reach the Sallyport GUI: "+e.message+" (was it closed? run it again)"});

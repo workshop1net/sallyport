@@ -1,0 +1,8 @@
+# Nothing secret may enter an image build context.
+.env
+.git
+generated
+sallyport.yaml
+targets.yaml
+pomerium-data
+__pycache__

@@ -10,6 +10,7 @@ Requires Python 3 and PyYAML; dev mode also needs the cryptography package.
 """
 import argparse
 import base64
+import uuid
 import json
 import os
 import re
@@ -17,6 +18,7 @@ import secrets
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 try:
@@ -99,7 +101,16 @@ def nonempty_str(section, key, value, maxlen=4000):
 
 # ---------------------------------------------------------------- config / init
 
-DEV_EMAIL = "kilgore@kilgore.trout"  # the fixed user Dex's mock connector signs in
+DEV_EMAIL = "kilgore@kilgore.trout"  # the dev administrator
+DEV_USERS = [  # throwaway logins on Dex's password connector; all use the password "password"
+    (DEV_EMAIL, "Kilgore Trout"),
+    ("billy.pilgrim@kilgore.trout", "Billy Pilgrim"),
+    ("eliot.rosewater@kilgore.trout", "Eliot Rosewater"),
+    ("montana.wildhack@kilgore.trout", "Montana Wildhack"),
+]
+DEV_PASSWORD = "password"
+DEV_PASSWORD_HASH = "$2a$10$zQ.dHIMQu4ZOzPGJD.774uctjfI68B5XJP.JUB61WW25FxQfnZeG."  # bcrypt of "password"
+SCHEDULE_RE = re.compile(r"^([01][0-9]|2[0-3]):[0-5][0-9]$")
 DEV_CLIENT_ID = "sallyport"
 
 
@@ -114,6 +125,33 @@ def parse_session(cfg):
     return lifetime, idle
 
 
+def parse_schedule(cfg):
+    updates = cfg.get("updates") or {}
+    if not isinstance(updates, dict):
+        die("updates must be a mapping")
+    check_keys("updates", updates, {"schedule"})
+    value = updates.get("schedule")
+    if value in (None, "", False):
+        return ""
+    if not isinstance(value, str) or not SCHEDULE_RE.match(value):
+        die("updates.schedule must be a quoted 24-hour time such as \"03:00\" (unquoted, YAML reads 03:00 as a number)")
+    return value
+
+
+def parse_admin(cfg):
+    admin = cfg.get("admin") or {}
+    if not isinstance(admin, dict):
+        die("admin must be a mapping")
+    check_keys("admin", admin, {"emails", "groups"})
+    emails = email_list("admin.emails", admin.get("emails") or [])
+    groups = admin.get("groups") or []
+    if not isinstance(groups, list):
+        die("admin.groups must be a list")
+    for g in groups:
+        nonempty_str("admin.groups", "entry", g, 256)
+    return emails, groups
+
+
 def shared_issuer(issuer):
     """True for issuers that authenticate the general public, not one organisation's users."""
     i = (issuer or "").lower().rstrip("/")
@@ -124,14 +162,15 @@ def shared_issuer(issuer):
 
 
 def validate_dev(cfg):
-    check_keys("sallyport.yaml (dev mode)", cfg, {"mode", "domain", "session"}, required=("domain",))
+    check_keys("sallyport.yaml (dev mode)", cfg, {"mode", "domain", "session", "updates"}, required=("domain",))
     domain = str(cfg["domain"]).lower()
     if not DOMAIN_RE.match(domain) or not domain.endswith(".localhost"):
         die("dev mode only runs on *.localhost names (for example access.localhost); "
             "it uses a throwaway login and an untrusted certificate and must never face a network")
     lifetime, idle = parse_session(cfg)
-    return {"mode": "dev", "domain": domain, "emails": [DEV_EMAIL], "groups": [], "groups_claim": "groups",
-            "domains": [], "open_idp": False,
+    return {"mode": "dev", "domain": domain, "emails": [e for e, _ in DEV_USERS], "groups": [], "groups_claim": "groups",
+            "domains": [], "open_idp": False, "admin_emails": [DEV_EMAIL], "admin_groups": [],
+            "update_time": parse_schedule(cfg),
             "lifetime": lifetime, "idle": idle, "client_secret": None}
 
 
@@ -141,7 +180,7 @@ def validate_config(cfg):
         die("mode must be production or dev")
     if mode == "dev":
         return validate_dev(cfg)
-    check_keys("sallyport.yaml", cfg, {"mode", "domain", "acme_email", "acme_staging", "idp", "access", "session"},
+    check_keys("sallyport.yaml", cfg, {"mode", "domain", "acme_email", "acme_staging", "idp", "access", "admin", "updates", "session"},
                required=("domain", "acme_email", "idp", "access"))
     domain = str(cfg["domain"]).lower()
     if not DOMAIN_RE.match(domain):
@@ -226,8 +265,12 @@ def validate_config(cfg):
         die("Google does not provide group claims; list people under access.emails instead")
 
     lifetime, idle = parse_session(cfg)
+    admin_emails, admin_groups = parse_admin(cfg)
+    if admin_groups and provider == "google":
+        die("Google does not provide group claims; list people under admin.emails instead")
 
     return {
+        "admin_emails": admin_emails, "admin_groups": admin_groups, "update_time": parse_schedule(cfg),
         "mode": "production", "domain": domain, "acme_email": email, "staging": staging,
         "provider": provider, "issuer": issuer, "client_id": idp["client_id"], "client_secret": idp["client_secret"],
         "scopes": scopes, "emails": [e.strip() for e in emails], "groups": groups,
@@ -273,6 +316,8 @@ def render_pomerium(c):
             idp = {"idp_client_id": c["client_id"]}          # Pomerium's Google provider has its own defaults
         elif c["provider"] == "auth0":
             idp = {"idp_provider_url": c["issuer"], "idp_client_id": c["client_id"]}
+    admin_policy = [{"email": {"is": e}} for e in c["admin_emails"]]
+    admin_policy += [{f"claim/{c['groups_claim']}": g} for g in c["admin_groups"]]
     config = {
         **tls,
         "authenticate_service_url": f"https://authenticate.{c['domain']}",
@@ -289,10 +334,24 @@ def render_pomerium(c):
             "policy": [{"allow": {"or": policy}}],
         }],
     }
+    if admin_policy:
+        # The admin site: its own host name, its own (much shorter) allow-list. pass_identity_headers makes
+        # Pomerium sign the user's identity (X-Pomerium-Jwt-Assertion) with SIGNING_KEY, which the admin
+        # service verifies itself rather than trusting a plain header.
+        config["routes"].append({
+            "from": f"https://admin.{c['domain']}",
+            "to": "http://admin:8080",
+            "pass_identity_headers": True,
+            "idle_timeout": c["idle"],
+            "policy": [{"allow": {"or": admin_policy}}],
+        })
     header = ("# Generated by ./sallyport init from sallyport.yaml. Do not edit.\n"
-              "# Secrets (shared_secret, cookie_secret, idp_client_secret) come from the\n"
+              "# Secrets (shared_secret, cookie_secret, signing_key, idp_client_secret) come from the\n"
               "# environment, set in compose.yaml from .env.\n")
     return header + yaml.safe_dump(config, sort_keys=False)
+
+
+CERT_REV = "|admin"  # bump when the certificate names change, so existing dev certificates are regenerated
 
 
 def make_dev_certs(certs, domain):
@@ -321,7 +380,7 @@ def make_dev_certs(certs, domain):
                                             key_agreement=False, encipher_only=False, decipher_only=False), critical=True)
                .sign(ca_key, hashes.SHA256()))
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    sans = [domain, f"authenticate.{domain}", f"dex.{domain}"]
+    sans = [domain, f"authenticate.{domain}", f"dex.{domain}", f"admin.{domain}"]
     cert = (x509.CertificateBuilder().subject_name(name(domain)).issuer_name(ca_cert.subject)
             .public_key(key.public_key()).serial_number(x509.random_serial_number())
             .not_valid_before(start).not_valid_after(end)
@@ -334,14 +393,14 @@ def make_dev_certs(certs, domain):
     (certs / "tls.crt").write_bytes(cert.public_bytes(pem))
     (certs / "tls.key").write_bytes(key.private_bytes(
         pem, serialization.PrivateFormat.TraditionalOpenSSL, serialization.NoEncryption()))
-    write_text(certs / "domain", domain)
+    write_text(certs / "domain", domain + CERT_REV)
 
 
 def dev_certs_current(certs, domain):
     marker, crt = certs / "domain", certs / "tls.crt"
     if not (crt.exists() and marker.exists() and (certs / "tls.key").exists() and (certs / "ca.crt").exists()):
         return False
-    if marker.read_text(encoding="utf-8") != domain:
+    if marker.read_text(encoding="utf-8") != domain + CERT_REV:
         return False
     try:
         import datetime
@@ -370,7 +429,10 @@ def init_dev(c, env):
         "storage": {"type": "memory"},
         "web": {"https": "0.0.0.0:5556", "tlsCert": "/certs/tls.crt", "tlsKey": "/certs/tls.key"},
         "oauth2": {"skipApprovalScreen": True},
-        "connectors": [{"type": "mockCallback", "id": "mock", "name": "Sallyport dev login"}],
+        "enablePasswordDB": True,
+        "staticPasswords": [
+            {"email": email, "hash": DEV_PASSWORD_HASH, "username": email.split("@")[0], "name": name,
+             "userID": str(uuid.uuid5(uuid.NAMESPACE_DNS, email))} for email, name in DEV_USERS],
         "staticClients": [{
             "id": DEV_CLIENT_ID, "name": "Sallyport", "secret": env["IDP_CLIENT_SECRET"],
             "redirectURIs": [f"https://authenticate.{domain}/oauth2/callback"],
@@ -391,6 +453,26 @@ def init_dev(c, env):
         print("wrote targets.yaml with test SSH and RDP targets")
 
 
+def new_signing_key():
+    """ECDSA P-256 key Pomerium signs identity assertions with; stored base64-encoded in .env."""
+    try:
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import ec
+    except ImportError:
+        die("this needs the cryptography package: pip install cryptography")
+    key = ec.generate_private_key(ec.SECP256R1())
+    # SEC1 "EC PRIVATE KEY" PEM, the format `openssl ecparam -genkey -name prime256v1` produces and Pomerium's docs use.
+    pem = key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.TraditionalOpenSSL,
+                            serialization.NoEncryption())
+    return base64.b64encode(pem).decode()
+
+
+def signing_public_pem(b64):
+    from cryptography.hazmat.primitives import serialization
+    key = serialization.load_pem_private_key(base64.b64decode(b64), password=None)
+    return key.public_key().public_bytes(serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo).decode()
+
+
 def cmd_init(args):
     c = validate_config(load_yaml(CONFIG))
     env = read_env()
@@ -400,6 +482,8 @@ def cmd_init(args):
         ("COOKIE_SECRET", lambda: base64.b64encode(secrets.token_bytes(32)).decode()),
         ("POSTGRES_PASSWORD", lambda: secrets.token_hex(24)),
         ("GUAC_APP_PASSWORD", lambda: secrets.token_hex(24)),
+        ("ADMIN_DB_PASSWORD", lambda: secrets.token_hex(24)),
+        ("SIGNING_KEY", lambda: new_signing_key()),
     ):
         if key not in env:
             env[key] = gen()
@@ -413,12 +497,14 @@ def cmd_init(args):
         env["IDP_CLIENT_SECRET"] = c["client_secret"]
         env["SALLYPORT_MODE"] = "production"
         env.pop("SALLYPORT_DOMAIN", None)
+    env["ADMIN_HOST"] = "admin." + c["domain"]
     lines = ["# Generated by ./sallyport init. Contains secrets; do not commit.\n"]
     lines += [f"{k}='{v}'\n" for k, v in sorted(env.items())]
     write_private(ENV_FILE, "".join(lines))
 
     GEN.mkdir(exist_ok=True)
     write_text(GEN / "pomerium.yaml", render_pomerium(c))
+    write_text(GEN / "admin-jwt.pub", signing_public_pem(env["SIGNING_KEY"]))
 
     if c["mode"] == "dev":
         init_dev(c, env)
@@ -451,18 +537,20 @@ def cmd_init(args):
     if c["mode"] == "dev":
         d = c["domain"]
         print("wrote .env, generated/pomerium.yaml, generated/dex.yaml, generated/certs/ and generated/initdb/")
-        print(f"\nDEV MODE: throwaway login, untrusted certificate, loopback only.\n\n"
-              "Next:\n  1. docker compose -f compose.yaml -f compose.dev.yaml up -d\n"
-              "  2. load-targets (loads the test SSH target)\n"
+        print(f"\nDEV MODE: throwaway logins, untrusted certificate, loopback only.\n\n"
+              "Next:\n  1. docker compose -f compose.yaml -f compose.dev.yaml up -d --build\n"
+              "  2. ./sallyport migrate-db (creates the admin tables and loads the test targets)\n"
               f"  3. open https://{d} and accept the certificate warning (or trust generated/certs/ca.crt);\n"
               f"     first open https://dex.{d}:5556 once and accept its warning too if the login redirect fails.\n"
-              "  Sign-in is automatic as kilgore@kilgore.trout (Dex's mock connector).")
+              f"  Sign in with one of: {', '.join(e for e, _ in DEV_USERS)} (password: {DEV_PASSWORD}).\n"
+              f"  {DEV_EMAIL} is the administrator and can also open https://admin.{d}.")
         return
     print(f"wrote {ENV_FILE.name} (new secrets: {', '.join(new) or 'none, existing kept'})")
     print("wrote generated/pomerium.yaml and generated/initdb/")
-    print(f"\nNext:\n  1. DNS: {c['domain']} and authenticate.{c['domain']} -> this server\n"
+    admin = f", and admin.{c['domain']}" if c["admin_emails"] or c["admin_groups"] else ""
+    print(f"\nNext:\n  1. DNS: {c['domain']}, authenticate.{c['domain']}{admin} -> this server\n"
           f"  2. IdP redirect URI: https://authenticate.{c['domain']}/oauth2/callback\n"
-          "  3. docker compose up -d\n  4. ./sallyport load-targets")
+          "  3. docker compose up -d --build\n  4. ./sallyport migrate-db")
     if c["staging"]:
         print("\nacme_staging is true: certificates will not be trusted by browsers. Set it to false\n"
               "in sallyport.yaml and re-run ./sallyport init, then docker compose up -d, once it works.")
@@ -780,6 +868,35 @@ def load_targets(data=None):
     return load_access(data)[0]
 
 
+INT_FIELDS = ("port", "max_sessions")
+SECRET_FIELDS = ("password", "private_key", "passphrase")
+
+
+def clean_document(payload):
+    """Normalise a document sent by an editor: drop empty values, turn digit strings into numbers."""
+    payload = payload if isinstance(payload, dict) else {}
+
+    def rows(items):
+        out = []
+        for t in items if isinstance(items, list) else []:
+            if not isinstance(t, dict):
+                continue
+            row = {}
+            for k, v in t.items():
+                if v is None or v == "":
+                    continue
+                if k in INT_FIELDS and isinstance(v, str) and v.strip().isdigit():
+                    v = int(v.strip())
+                row[str(k)] = v
+            out.append(row)
+        return out
+
+    users = [str(u).strip().lower() for u in payload.get("users") or [] if str(u).strip()]
+    groups = [{"name": g.get("name", ""), "users": [str(u).strip().lower() for u in g.get("users") or [] if str(u).strip()]}
+              for g in payload.get("groups") or [] if isinstance(g, dict)]
+    return {"systems": rows(payload.get("systems")), "users": users, "groups": groups, "logins": rows(payload.get("logins"))}
+
+
 def legacy_to_v2(items):
     """Convert the old flat `targets:` list into systems, users and logins (for the GUI)."""
     systems, seen, logins, users = [], set(), [], []
@@ -810,8 +927,71 @@ def legacy_to_v2(items):
     return {"systems": systems, "users": users, "groups": [], "logins": logins}
 
 
-def cmd_load_targets(args):
-    targets, groups, _users = load_access()
+ADMIN_ROLE = "sallyport_admin"
+GUAC_TABLES = ("guacamole_entity", "guacamole_user", "guacamole_user_group", "guacamole_user_group_member",
+               "guacamole_connection", "guacamole_connection_parameter", "guacamole_connection_permission")
+GUAC_SEQUENCES = ("guacamole_entity_entity_id_seq", "guacamole_user_user_id_seq",
+                  "guacamole_user_group_user_group_id_seq", "guacamole_connection_connection_id_seq")
+
+
+def migrate_sql(password):
+    """Idempotent: the admin role (limited to the tables the admin site manages) and Sallyport's own tables."""
+    if not re.fullmatch(r"[0-9a-f]{16,128}", password or ""):
+        die("ADMIN_DB_PASSWORD is missing or not hex in .env; run ./sallyport init first")
+    return f"""-- Sallyport admin site: role and tables
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{ADMIN_ROLE}') THEN CREATE ROLE {ADMIN_ROLE} LOGIN; END IF;
+END $$;
+ALTER ROLE {ADMIN_ROLE} PASSWORD '{password}';
+CREATE TABLE IF NOT EXISTS sallyport_state (
+  id integer PRIMARY KEY CHECK (id = 1), document jsonb NOT NULL, version bigint NOT NULL DEFAULT 1,
+  updated_at timestamptz NOT NULL DEFAULT now(), updated_by text NOT NULL DEFAULT '');
+CREATE TABLE IF NOT EXISTS sallyport_audit (
+  id bigserial PRIMARY KEY, at timestamptz NOT NULL DEFAULT now(), actor text NOT NULL,
+  action text NOT NULL, detail text NOT NULL DEFAULT '');
+REVOKE ALL ON sallyport_state, sallyport_audit FROM PUBLIC;
+GRANT SELECT, INSERT, UPDATE, DELETE ON {', '.join(GUAC_TABLES)} TO {ADMIN_ROLE};
+GRANT SELECT, INSERT, UPDATE ON sallyport_state TO {ADMIN_ROLE};
+GRANT SELECT, INSERT ON sallyport_audit TO {ADMIN_ROLE};
+GRANT USAGE, SELECT ON SEQUENCE {', '.join(GUAC_SEQUENCES)}, sallyport_audit_id_seq TO {ADMIN_ROLE};
+"""
+
+
+def state_sql(doc, actor, action, detail):
+    """Store the targets document as the current state (version + 1) and write an audit row."""
+    return ("INSERT INTO sallyport_state (id, document, version, updated_by) "
+            f"VALUES (1, {q(json.dumps(doc))}::jsonb, 1, {q(actor)})\n"
+            "ON CONFLICT (id) DO UPDATE SET document = EXCLUDED.document, version = sallyport_state.version + 1, "
+            "updated_at = now(), updated_by = EXCLUDED.updated_by;\n"
+            f"INSERT INTO sallyport_audit (actor, action, detail) VALUES ({q(actor)}, {q(action)}, {q(detail)});\n")
+
+
+def run_psql(sql):
+    """Run SQL as the database owner: through the stack's postgres container, or (inside the helper container) over its network."""
+    base = ["psql", "-v", "ON_ERROR_STOP=1", "--single-transaction", "-q", "-At", "-U", DB_OWNER, "-d", DB_NAME, "-f", "-"]
+    if IN_CONTAINER:
+        env = dict(os.environ, PGPASSWORD=read_env().get("POSTGRES_PASSWORD", ""))
+        return subprocess.run(["psql", "-h", "postgres"] + base[1:], input=sql, text=True, encoding="utf-8",
+                              capture_output=True, env=env)
+    return subprocess.run(["docker", "compose", "exec", "-T", "postgres"] + base, input=sql, text=True,
+                          encoding="utf-8", capture_output=True, cwd=ROOT)
+
+
+def psql_or_die(sql, what):
+    r = run_psql(sql)
+    if r.returncode != 0:
+        die(f"{what} failed; nothing was changed (single transaction). {(r.stderr or '').strip()[:300]}")
+    return r.stdout
+
+
+def targets_document(data):
+    """The four-list document stored in the database, from either file format."""
+    if "targets" in data:
+        return legacy_to_v2(data["targets"])
+    return {k: data.get(k) or [] for k in ("systems", "users", "groups", "logins")}
+
+
+def warn_open(targets):
     saved = ("username", "password", "private_key", "passphrase")
     everyone = [t["name"] for t in targets if "users" not in t and "groups" not in t and any(k in t for k in saved)]
     if everyone:
@@ -820,20 +1000,381 @@ def cmd_load_targets(args):
     shared = [t["name"] for t in targets if "groups" in t and any(k in t for k in saved)]
     if shared:
         print("note: saved credentials shared by every member of a group (not one account per person): " + ", ".join(shared))
+
+
+def import_targets(data, actor, action, detail):
+    targets, groups, _users = load_access(data)
+    warn_open(targets)
+    psql_or_die(state_sql(targets_document(data), actor, action, detail) + build_sql(targets, groups), "loading targets")
+    return len(targets)
+
+
+def cmd_migrate_db(args):
+    """Create the admin role and tables; if the database holds no targets yet, import targets.yaml (if there is one)."""
+    psql_or_die(migrate_sql(read_env().get("ADMIN_DB_PASSWORD")), "database migration")
+    print("admin role and tables are in place")
+    if psql_or_die("SELECT count(*) FROM sallyport_state;", "reading state").strip() != "0":
+        return
+    if TARGETS.exists():
+        n = import_targets(load_yaml(TARGETS), "cli", "import", "initial import from targets.yaml")
+        print(f"imported {n} login(s) from targets.yaml. The admin site is now where targets are edited;"
+              " targets.yaml is only read again by load-targets.")
+    else:
+        print("no targets yet: add them in the admin site")
+
+
+def cmd_load_targets(args):
+    """Import targets.yaml into the database, replacing what is stored there (admin site edits included)."""
+    data = load_yaml(TARGETS)
+    targets, groups, _users = load_access(data)
     if args.dry_run:
+        warn_open(targets)
         print(build_sql(targets, groups, redact=True))
         return
-    sql = build_sql(targets, groups)
-    psql = ["psql", "-v", "ON_ERROR_STOP=1", "--single-transaction", "-q", "-U", DB_OWNER, "-d", DB_NAME, "-f", "-"]
-    if IN_CONTAINER:
-        env = dict(os.environ, PGPASSWORD=read_env().get("POSTGRES_PASSWORD", ""))
-        result = subprocess.run(["psql", "-h", "postgres"] + psql[1:], input=sql, text=True, encoding="utf-8", env=env)
-    else:
-        result = subprocess.run(["docker", "compose", "exec", "-T", "postgres"] + psql,
-                                input=sql, text=True, encoding="utf-8", cwd=ROOT)
-    if result.returncode != 0:
-        die("loading targets failed; nothing was changed (single transaction)")
-    print(f"loaded {len(targets)} target(s)")
+    psql_or_die(migrate_sql(read_env().get("ADMIN_DB_PASSWORD")), "database migration")
+    n = import_targets(data, "cli", "import", "load-targets from targets.yaml")
+    print(f"loaded {n} login(s), replacing what the database held")
+
+
+def cmd_export_targets(args):
+    """Write the database's targets (credentials included, in plain text) to targets.yaml."""
+    out = psql_or_die("SELECT document FROM sallyport_state WHERE id = 1;", "reading state").strip()
+    if not out:
+        die("the database holds no targets yet")
+    if TARGETS.exists() and not args.force:
+        die(f"{TARGETS.name} already exists; use --force to overwrite it")
+    doc = json.loads(out)
+    header = ("# Exported by ./sallyport export-targets. Contains credentials in plain text.\n"
+              "# The database (edited in the admin site) is the source of truth; this file is a copy.\n")
+    write_private(TARGETS, header + yaml.safe_dump(doc, sort_keys=False))
+    print(f"wrote {TARGETS.name}")
+
+
+# ------------------------------------------------------------------- updates
+
+def now_iso():
+    import datetime
+    return datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+class UpdateLog:
+    """Timestamped lines to the console and to generated/update.log (trimmed to the last ~200 KB)."""
+
+    def __init__(self):
+        GEN.mkdir(exist_ok=True)
+        self.path = GEN / "update.log"
+        try:
+            if self.path.exists() and self.path.stat().st_size > 400_000:
+                self.path.write_text(self.path.read_text(encoding="utf-8", errors="replace")[-200_000:], encoding="utf-8")
+        except OSError:
+            pass
+
+    def __call__(self, text):
+        line = f"{now_iso()} {text}"
+        print(text, flush=True)
+        try:
+            with open(self.path, "a", encoding="utf-8", newline="\n") as f:
+                f.write(line + "\n")
+        except OSError:
+            pass
+
+
+def compose_argv(*args):
+    dev = read_env().get("SALLYPORT_MODE") == "dev"
+    files = ["-f", "compose.yaml", "-f", "compose.dev.yaml"] if dev else []
+    return ["docker", "compose", "--progress", "plain", *files, *args]
+
+
+def sh(log, cmd, timeout=1800, check=True):
+    """Run a command in the checkout, logging its output. Returns (returncode, output)."""
+    log("$ " + " ".join(cmd))
+    try:
+        r = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log(f"error: {e}")
+        if check:
+            raise UpdateFailed(f"{cmd[0]} {cmd[1] if len(cmd) > 1 else ''} failed")
+        return 1, ""
+    out = ((r.stdout or "") + (r.stderr or "")).strip()
+    for line in out.splitlines()[-40:]:
+        log("  " + line)
+    if check and r.returncode != 0:
+        raise UpdateFailed(f"{' '.join(cmd[:3])} failed (exit {r.returncode})")
+    return r.returncode, out
+
+
+class UpdateFailed(Exception):
+    pass
+
+
+def image_ids(log):
+    """{image reference: local image id or ''} for every image the stack uses."""
+    _, out = sh(log, compose_argv("config", "--images"), timeout=60, check=False)
+    ids = {}
+    for ref in sorted(set(out.split())):
+        rc, got = sh(log, ["docker", "image", "inspect", "--format", "{{.Id}}", ref], timeout=30, check=False)
+        ids[ref] = got.strip() if rc == 0 else ""
+    return ids
+
+
+def file_hashes(names):
+    import hashlib
+    out = {}
+    for n in names:
+        p = GEN / n
+        out[n] = hashlib.sha256(p.read_bytes()).hexdigest() if p.exists() else ""
+    return out
+
+
+def stack_healthy(log, wait=150):
+    """True once every service is running (and healthy where it has a healthcheck) on two checks 10 s apart."""
+    deadline, good = time.time() + wait, 0
+    while time.time() < deadline:
+        rc, out = sh(log, compose_argv("ps", "--all", "--format", "json"), timeout=60, check=False)
+        rows = []
+        try:
+            data = json.loads(out) if out.lstrip().startswith("[") else [json.loads(x) for x in out.splitlines() if x.strip().startswith("{")]
+            rows = data if isinstance(data, list) else [data]
+        except ValueError:
+            pass
+        ok = bool(rows) and all(r.get("State") == "running" and r.get("Health") in ("", None, "healthy") for r in rows)
+        good = good + 1 if ok else 0
+        if good >= 2:
+            return True
+        time.sleep(10)
+    return False
+
+
+def write_update_status(**kw):
+    GEN.mkdir(exist_ok=True)
+    write_text(GEN / "update-status.json", json.dumps({"at": now_iso(), **kw}))
+
+
+def acquire_update_lock():
+    GEN.mkdir(exist_ok=True)
+    lock = GEN / "update.lock"
+    try:
+        if lock.exists() and time.time() - lock.stat().st_mtime > 3 * 3600:
+            lock.unlink()  # a crashed run
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        return None
+    os.write(fd, str(os.getpid()).encode())
+    os.close(fd)
+    return lock
+
+
+def helper(*args):
+    return [sys.executable, "-I", str(ROOT / "sallyport"), *args]
+
+
+def cmd_update(args):
+    """Fetch the latest code and images, recreate what changed, migrate the database, check the stack is healthy,
+    and roll back if it is not. Safe to run unattended; does nothing when there is nothing new."""
+    log = UpdateLog()
+    unattended = getattr(args, "unattended", False)
+    lock = acquire_update_lock()
+    if lock is None:
+        log("another update is already running; nothing done")
+        raise SystemExit(0 if unattended else "error: another update is already running")
+    start_sha, moved = "", False
+    before, hashes_before = {}, {}
+    try:
+        if not (ROOT / ".git").exists():
+            raise UpdateFailed("this folder is not a git checkout")
+        if not (ENV_FILE.exists() and (GEN / "pomerium.yaml").exists()):
+            raise UpdateFailed("run ./sallyport init first")
+        _, start_sha = sh(log, ["git", "rev-parse", "HEAD"], timeout=20)
+        sh(log, ["git", "fetch", "--quiet"], timeout=120)
+        _, counts = sh(log, ["git", "rev-list", "--left-right", "--count", "HEAD...@{u}"], timeout=20)
+        ahead, behind = (int(x) for x in counts.split()[:2])
+        if behind and ahead:
+            raise UpdateFailed(f"this checkout has {ahead} local commit(s) and is {behind} behind; update it by hand")
+        if behind:
+            _, dirty = sh(log, ["git", "status", "--porcelain", "--untracked-files=no"], timeout=30)
+            if dirty:
+                raise UpdateFailed("there are local changes to tracked files; commit or discard them first")
+        before = image_ids(log)
+        hashes_before = file_hashes(["pomerium.yaml", "dex.yaml", "admin-jwt.pub"])
+        if behind:
+            sh(log, ["git", "merge", "--ff-only", "@{u}"], timeout=120)
+            moved = True
+        rc, _ = sh(log, compose_argv("pull", "--ignore-buildable"), check=False)
+        if rc != 0:
+            sh(log, compose_argv("pull", "--ignore-pull-failures"))
+        sh(log, helper("init", "--quiet"), timeout=600)
+        sh(log, compose_argv("build", "--pull", "admin"))
+        after = image_ids(log)
+        changed_images = sorted(r for r in after if after[r] != before.get(r, ""))
+        config_changed = file_hashes(["pomerium.yaml", "dex.yaml", "admin-jwt.pub"]) != hashes_before
+        if not (moved or changed_images or config_changed):
+            log("already up to date")
+            write_update_status(ok=True, changed=False, summary="Already up to date.", unattended=unattended)
+            return
+        _, end_sha = sh(log, ["git", "rev-parse", "--short", "HEAD"], timeout=20)
+        log(f"applying: code {'updated' if moved else 'unchanged'}, images changed: {', '.join(changed_images) or 'none'}, "
+            f"generated configuration {'changed' if config_changed else 'unchanged'}")
+        sh(log, compose_argv("up", "-d", "--build", "--remove-orphans"))
+        if config_changed:
+            dev = read_env().get("SALLYPORT_MODE") == "dev"
+            sh(log, compose_argv("up", "-d", "--force-recreate", "--no-deps", "pomerium", *(["dex"] if dev else []), "admin"))
+        for attempt in range(12):  # the database may still be starting
+            rc, _ = sh(log, helper("migrate-db"), timeout=300, check=False)
+            if rc == 0:
+                break
+            time.sleep(5)
+        else:
+            raise UpdateFailed("the database migration did not succeed")
+        if not stack_healthy(log):
+            raise UpdateFailed("the stack did not become healthy after the update")
+        summary = f"Updated to {end_sha}." if moved else "Updated container images or configuration."
+        log(summary)
+        write_update_status(ok=True, changed=True, summary=summary, unattended=unattended)
+    except UpdateFailed as e:
+        log(f"UPDATE FAILED: {e}")
+        rolled = False
+        if before and (moved or any(before.values())):
+            try:
+                log("rolling back to the previous version")
+                if moved and start_sha:
+                    sh(log, ["git", "reset", "--hard", start_sha], timeout=60)
+                for ref, old in before.items():
+                    if old:
+                        sh(log, ["docker", "tag", old, ref], timeout=60, check=False)
+                sh(log, helper("init", "--quiet"), timeout=600, check=False)
+                sh(log, compose_argv("up", "-d", "--force-recreate"), check=False)
+                rolled = stack_healthy(log, wait=120)
+                log("rollback " + ("succeeded" if rolled else "did not restore a healthy stack: check it by hand"))
+            except Exception as e2:  # keep the original failure the headline
+                log(f"rollback error: {e2}")
+        write_update_status(ok=False, changed=moved, summary=f"Update failed: {e}", rolled_back=rolled, unattended=unattended)
+        raise SystemExit(f"error: update failed: {e}" + (" (rolled back)" if rolled else ""))
+    finally:
+        try:
+            lock.unlink()
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------- scheduled updates
+
+SCHEDULE_NAME = "Sallyport update"
+CRON_MARK = "# sallyport-update"
+
+
+def update_argv():
+    return [sys.executable, "-I", str(ROOT / "sallyport"), "update", "--unattended"]
+
+
+def cron_line(hhmm):
+    import shlex
+    hh, mm = hhmm.split(":")
+    cmd = " ".join(shlex.quote(a) for a in update_argv())
+    return f"{int(mm)} {int(hh)} * * * cd {shlex.quote(str(ROOT))} && {cmd} >> {shlex.quote(str(GEN / 'update-cron.log'))} 2>&1 {CRON_MARK}"
+
+
+def systemd_units(hhmm, user):
+    import shlex
+    cmd = " ".join(shlex.quote(a) for a in update_argv())
+    service = ("[Unit]\nDescription=Sallyport unattended update\nAfter=docker.service network-online.target\n\n"
+               f"[Service]\nType=oneshot\nUser={user}\nWorkingDirectory={ROOT}\nExecStart={cmd}\n")
+    timer = ("[Unit]\nDescription=Sallyport unattended update, daily\n\n"
+             f"[Timer]\nOnCalendar=*-*-* {hhmm}:00\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n")
+    return service, timer
+
+
+def schtasks_create_args(hhmm):
+    tr = subprocess.list2cmdline(update_argv())
+    return ["schtasks", "/Create", "/F", "/TN", SCHEDULE_NAME, "/SC", "DAILY", "/ST", hhmm, "/TR", tr]
+
+
+def have(cmd):
+    return shutil.which(cmd) is not None
+
+
+def use_systemd():
+    return os.name != "nt" and hasattr(os, "geteuid") and os.geteuid() == 0 and have("systemctl") and Path("/run/systemd/system").exists()
+
+
+def crontab_lines():
+    r = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
+    return [] if r.returncode != 0 else [ln for ln in r.stdout.splitlines()]
+
+
+def set_crontab(lines):
+    r = subprocess.run(["crontab", "-"], input="\n".join(lines) + "\n", text=True, capture_output=True)
+    if r.returncode != 0:
+        die("could not update the crontab: " + (r.stderr or "").strip())
+
+
+def schedule_remove():
+    if os.name == "nt":
+        subprocess.run(["schtasks", "/Delete", "/F", "/TN", SCHEDULE_NAME], capture_output=True)
+    elif use_systemd() or Path("/etc/systemd/system/sallyport-update.timer").exists():
+        if have("systemctl"):
+            subprocess.run(["systemctl", "disable", "--now", "sallyport-update.timer"], capture_output=True)
+        for n in ("sallyport-update.timer", "sallyport-update.service"):
+            try:
+                (Path("/etc/systemd/system") / n).unlink()
+            except OSError:
+                pass
+        if have("systemctl"):
+            subprocess.run(["systemctl", "daemon-reload"], capture_output=True)
+    if os.name != "nt" and have("crontab"):
+        lines = crontab_lines()
+        if any(CRON_MARK in ln for ln in lines):
+            set_crontab([ln for ln in lines if CRON_MARK not in ln])
+
+
+def schedule_install(hhmm):
+    schedule_remove()
+    if os.name == "nt":
+        r = subprocess.run(schtasks_create_args(hhmm), capture_output=True, text=True)
+        if r.returncode != 0:
+            die("schtasks failed: " + (r.stderr or r.stdout).strip())
+        return "Windows Task Scheduler (runs while you are signed in, because Docker Desktop does)"
+    if use_systemd():
+        import pwd
+        user = pwd.getpwuid(ROOT.stat().st_uid).pw_name
+        service, timer = systemd_units(hhmm, user)
+        Path("/etc/systemd/system/sallyport-update.service").write_text(service)
+        Path("/etc/systemd/system/sallyport-update.timer").write_text(timer)
+        subprocess.run(["systemctl", "daemon-reload"], check=True)
+        subprocess.run(["systemctl", "enable", "--now", "sallyport-update.timer"], check=True)
+        return f"a systemd timer, running as {user}"
+    if not have("crontab"):
+        die("no scheduler found: run as root on a systemd host, or install cron")
+    set_crontab(crontab_lines() + [cron_line(hhmm)])
+    return "your user crontab"
+
+
+def schedule_status():
+    if os.name == "nt":
+        r = subprocess.run(["schtasks", "/Query", "/TN", SCHEDULE_NAME], capture_output=True, text=True)
+        return r.returncode == 0, "Windows Task Scheduler"
+    if Path("/etc/systemd/system/sallyport-update.timer").exists():
+        return True, "a systemd timer"
+    if have("crontab") and any(CRON_MARK in ln for ln in crontab_lines()):
+        return True, "your user crontab"
+    return False, ""
+
+
+def cmd_schedule(args):
+    c = validate_config(load_yaml(CONFIG))
+    if args.action == "status":
+        on, where = schedule_status()
+        print(f"installed: {where}" if on else "no scheduled update is installed")
+        return
+    if args.action == "remove" or (args.action == "apply" and not c["update_time"]):
+        schedule_remove()
+        print("scheduled update removed" if args.action == "remove" else
+              "updates.schedule is empty in sallyport.yaml, so no scheduled update is installed")
+        return
+    if not c["update_time"]:
+        die("set updates.schedule (for example \"03:00\") in sallyport.yaml first")
+    where = schedule_install(c["update_time"])
+    print(f"scheduled an unattended update every day at {c['update_time']} (this computer's local time) using {where}")
+
 
 
 def main():
@@ -842,10 +1383,22 @@ def main():
     sub = parser.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("init", help="create secrets and generated configuration")
     p.add_argument("--no-schema", action="store_true", help="skip Docker schema generation (testing only)")
+    p.add_argument("--quiet", action="store_true", help="print one line instead of the next-steps text")
     p.set_defaults(func=cmd_init)
-    p = sub.add_parser("load-targets", help="load targets.yaml into Guacamole")
+    p = sub.add_parser("update", help="pull the latest code and images, recreate what changed, check health, roll back on failure")
+    p.add_argument("--unattended", action="store_true", help="for scheduled runs: exit quietly if another update is running")
+    p.set_defaults(func=cmd_update)
+    p = sub.add_parser("schedule", help="install, remove or show the scheduled unattended update")
+    p.add_argument("action", choices=["apply", "remove", "status"], help="apply installs or removes it to match updates.schedule")
+    p.set_defaults(func=cmd_schedule)
+    p = sub.add_parser("migrate-db", help="create the admin role and tables; import targets.yaml if the database is empty")
+    p.set_defaults(func=cmd_migrate_db)
+    p = sub.add_parser("load-targets", help="import targets.yaml into the database, replacing its targets")
     p.add_argument("--dry-run", action="store_true", help="print the SQL with secrets redacted and exit")
     p.set_defaults(func=cmd_load_targets)
+    p = sub.add_parser("export-targets", help="write the database's targets to targets.yaml")
+    p.add_argument("--force", action="store_true", help="overwrite an existing targets.yaml")
+    p.set_defaults(func=cmd_export_targets)
     args = parser.parse_args()
     args.func(args)
 
