@@ -868,15 +868,21 @@ details summary{cursor:pointer;margin-bottom:8px}
 <section><h2>Settings</h2>
 <div class="sub" id="cstatus"></div>
 <div class="grid">
-<label for="c_mode">Mode</label><select id="c_mode"><option value="production">Production (Let's Encrypt + your IdP)</option><option value="dev">Dev (local test: private certificate, mock login)</option></select>
-<label for="c_domain">Domain</label><input type="text" id="c_domain" placeholder="access.client.example (dev: access.localhost)">
+<label for="c_mode">Setup</label><select id="c_mode">
+<option value="duck_auth0">Production: free DuckDNS name + Auth0 (easiest)</option>
+<option value="own_auth0">Production: your own domain name + Auth0</option>
+<option value="own_other">Production: your own domain name + another identity provider</option>
+<option value="duck_other">Production: free DuckDNS name + another identity provider</option>
+<option value="dev">Dev: local testing only (private certificate, throwaway logins)</option></select>
+<label class="r_own" for="c_domain">Domain</label><input class="r_own" type="text" id="c_domain" placeholder="access.client.example">
+<label class="r_duck" for="c_ddns_sub">DuckDNS name</label><input class="r_duck" type="text" id="c_ddns_sub" placeholder="myfirm (for myfirm.duckdns.org)">
+<label class="r_duck" for="c_ddns_token">DuckDNS token</label><input class="r_duck" type="password" id="c_ddns_token" autocomplete="off" placeholder="shown on your duckdns.org page">
 </div>
+<div id="addrInfo" class="sub"></div>
 <div id="prodFields"><div class="grid">
-<label for="c_ddns_sub">DuckDNS name</label><input type="text" id="c_ddns_sub" placeholder="optional: myfirm (for myfirm.duckdns.org)">
-<label for="c_ddns_token">DuckDNS token</label><span class="row"><input type="password" id="c_ddns_token" autocomplete="off"></span>
 <label for="c_acme_email">ACME email</label><input type="text" id="c_acme_email" placeholder="ops@msp.example">
 <label for="c_staging">Let's Encrypt staging</label><span><input type="checkbox" id="c_staging"> <label for="c_staging" class="sub">untrusted test certificates; untick for real ones</label></span>
-<label for="c_provider">Identity provider</label><select id="c_provider"><option value="oidc">Generic OpenID Connect</option><option value="auth0">Auth0</option><option value="google">Google</option></select>
+<label class="r_prov" for="c_provider">Identity provider</label><select class="r_prov" id="c_provider"><option value="oidc">Generic OpenID Connect</option><option value="auth0">Auth0</option><option value="google">Google</option></select>
 <label class="p_oidc" for="c_issuer">Issuer URL</label><input class="p_oidc" type="text" id="c_issuer" placeholder="https://login.example.com/tenant/v2.0">
 <label class="p_auth0" for="c_idp_domain">Auth0 tenant domain</label><input class="p_auth0" type="text" id="c_idp_domain" placeholder="example.eu.auth0.com">
 <label for="c_client_id">Client ID</label><input type="text" id="c_client_id">
@@ -892,7 +898,6 @@ details summary{cursor:pointer;margin-bottom:8px}
 <label for="c_aemails">Admin site: emails</label><textarea id="c_aemails" class="small" placeholder="one per line: who may open the admin site"></textarea>
 <label class="p_groups" for="c_agroups">Admin site: groups</label><textarea id="c_agroups" class="small p_groups" placeholder="one group ID per line (optional)"></textarea>
 </div>
-<div class="sub">No domain of your own? Register a free name at <b>duckdns.org</b>, enter the name and your token above and leave Domain empty. Sallyport then uses <code>name.duckdns.org</code>, keeps it pointed at this server even when your public address changes, and the <code>authenticate.</code> and <code>admin.</code> names work with no further DNS. You still need ports 80 and 443 forwarded to this machine, and a public (non carrier-grade NAT) address. The token is stored in plain text in <code>sallyport.yaml</code>.</div>
 <div class="sub">The admin site (<code>admin.&lt;your domain&gt;</code>) is where systems, people, groups and logins are managed. It is reached through the same login as everything else but has its own allow-list: only the accounts listed here. Leave both empty to turn it off. It needs a DNS record for <code>admin.&lt;your domain&gt;</code> pointing at this server, like the main one.</div>
 <details id="idpHelp" open><summary><b>How to set this up with your identity provider</b></summary><div id="helpBody" class="sub"></div>
 <div id="actionBox" class="hide"><div class="sub">Auth0 login Action for groups (Actions &rarr; Library &rarr; Create Action &rarr; Login / Post Login; deploy it, then add it to the Login flow):</div>
@@ -1049,12 +1054,26 @@ $("#validate").onclick=()=>fileAction("validate"); $("#save").onclick=()=>fileAc
 $("#quit").onclick=async()=>{try{await api("/api/quit",{})}catch(e){} document.body.textContent="Stopped. You can close this tab."};
 
 /* ---- settings form ---- */
-const CF={mode:"c_mode",domain:"c_domain",acme_email:"c_acme_email",provider:"c_provider",issuer:"c_issuer",idp_domain:"c_idp_domain",client_id:"c_client_id",client_secret:"c_secret",groups_claim:"c_claim",lifetime:"c_life",idle_timeout:"c_idle",update_time:"c_upd",ddns_subdomain:"c_ddns_sub",ddns_token:"c_ddns_token"};
+const CF={domain:"c_domain",acme_email:"c_acme_email",provider:"c_provider",issuer:"c_issuer",idp_domain:"c_idp_domain",client_id:"c_client_id",client_secret:"c_secret",groups_claim:"c_claim",lifetime:"c_life",idle_timeout:"c_idle",update_time:"c_upd",ddns_subdomain:"c_ddns_sub",ddns_token:"c_ddns_token"};
 const lines=v=>(v||"").split(/\r?\n/).map(x=>x.trim()).filter(Boolean);
 const ACTION_CODE="exports.onExecutePostLogin = async (event, api) => {\n  if (event.authorization) {\n    api.idToken.setCustomClaim('pomerium.io/groups', event.authorization.roles);\n  }\n};\n";
 function helpList(items){const ol=document.createElement("ol");items.forEach(t=>{const l=document.createElement("li");l.textContent=t;ol.appendChild(l)});return ol}
 function cfgShow(){
-  const dev=$("#c_mode").value==="dev", prov=$("#c_provider").value;
+  const P=presetOf(), dev=P.dev, prov=P.prov||$("#c_provider").value;
+  $$(".r_own").forEach(e=>e.classList.toggle("hide",!!P.duck)); $$(".r_duck").forEach(e=>e.classList.toggle("hide",dev||!P.duck));
+  $$(".r_prov").forEach(e=>e.classList.toggle("hide",!!P.prov));
+  const sub=$("#c_ddns_sub").value.trim().toLowerCase().replace(/\.duckdns\.org$/,""), own=$("#c_domain").value.trim()||"<your domain>";
+  const host=P.duck?(sub||"<name>")+".duckdns.org":own, ai=$("#addrInfo"); ai.textContent="";
+  const line=(t,b)=>{const d=document.createElement("div");d.textContent=t;if(b)d.style.fontWeight="600";ai.appendChild(d)};
+  if(dev){line("Dev mode needs no DNS: browsers send *.localhost to your own machine. Domain must end in .localhost.")}
+  else if(P.duck){
+    line("Your address will be https://"+host+" . Register the name free at duckdns.org (sign in, add the name, copy the token). Sallyport keeps the name pointed at this server, even if your public address changes.");
+    line("authenticate."+host+" and admin."+host+" work automatically: DuckDNS answers for every name under yours. You still need ports 80 and 443 forwarded to this machine from your router, and a public address (not behind carrier-grade NAT). The token is stored in plain text in sallyport.yaml.");
+  }else{
+    line("DNS names needed, all pointing at this server's public address (three A records, or one wildcard *."+own+" plus "+own+"):",true);
+    line("  "+own+"    authenticate."+own+"    admin."+own);
+    line("Ports 80 and 443 must be forwarded to this machine; Let's Encrypt needs both. If the address is not fixed, use the DuckDNS setup instead.");
+  }
   $("#prodFields").classList.toggle("hide",dev); $("#devNote").style.display=dev?"":"none";
   $$(".p_oidc").forEach(e=>e.classList.toggle("hide",prov!=="oidc"));
   $$(".p_auth0").forEach(e=>e.classList.toggle("hide",prov!=="auth0"));
@@ -1065,7 +1084,7 @@ function cfgShow(){
   const io=$("#idpOpen"); io.classList.toggle("hide",dev||!none); io.classList.toggle("bad",pub); io.classList.toggle("upd",!pub);
   io.textContent=pub?"⚠ Nothing is listed, which would admit anyone this identity provider authenticates, and this one authenticates the general public. List emails or domains; Sallyport will refuse to save otherwise."
     :"ⓘ Nothing is listed here, so anyone your identity provider authenticates can reach Sallyport. That is fine if the identity provider's Sallyport application only admits the people you intend (Auth0 does not do this by default: restrict the application with a login Action or Organizations). List emails, groups or domains here to add a second check.";
-  const d=$("#c_domain").value.trim()||"<domain>", auth="https://authenticate."+d;
+  const auth="https://authenticate."+host;
   const hb=$("#helpBody"); hb.textContent=""; $("#actionBox").classList.toggle("hide",prov!=="auth0");
   if(prov==="auth0"){
     hb.appendChild(helpList([
@@ -1088,8 +1107,18 @@ function cfgShow(){
       "For groups, the provider must put them in the ID token under the claim name given above."]));
   }
 }
+const PRESETS={dev:{dev:1},duck_auth0:{duck:1,prov:"auth0"},own_auth0:{prov:"auth0"},own_other:{},duck_other:{duck:1}};
+function presetOf(){return PRESETS[$("#c_mode").value]||PRESETS.duck_auth0}
+function presetKey(d){
+  if(d.preset)return d.preset;
+  if(d.mode==="dev")return "dev";
+  const duck=!!(d.ddns_subdomain||d.ddns_token), auth0=d.provider==="auth0";
+  return (duck?"duck_":"own_")+(auth0?"auth0":"other");
+}
 function getCfg(){
   const d={}; for(const k in CF)d[k]=$("#"+CF[k]).value;
+  const P=presetOf(); d.mode=P.dev?"dev":"production"; if(P.prov)d.provider=P.prov;
+  if(P.duck){d.domain=""}else{d.ddns_subdomain="";d.ddns_token=""}
   d.acme_staging=$("#c_staging").checked;
   d.scopes=($("#c_scopes").value.split(/[\s,]+/)).filter(Boolean);
   d.emails=lines($("#c_emails").value); d.groups=lines($("#c_groups").value); d.domains=lines($("#c_domains").value);
@@ -1098,8 +1127,9 @@ function getCfg(){
   return d;
 }
 function setCfg(d){
-  d=d||{mode:"production",provider:"oidc",acme_staging:true,scopes:["openid","profile","email"],groups_claim:"",lifetime:"8h",idle_timeout:"30m"};
+  d=d||{preset:"duck_auth0",mode:"production",provider:"auth0",acme_staging:true,scopes:["openid","profile","email"],groups_claim:"",lifetime:"8h",idle_timeout:"30m"};
   for(const k in CF)$("#"+CF[k]).value=d[k]??"";
+  $("#c_mode").value=presetKey(d);
   $("#c_staging").checked=d.acme_staging!==false;
   $("#c_scopes").value=(d.scopes||[]).join(" ");
   $("#c_emails").value=(d.emails||[]).join("\n"); $("#c_groups").value=(d.groups||[]).join("\n"); $("#c_domains").value=(d.domains||[]).join("\n");
@@ -1120,7 +1150,7 @@ async function cfgAction(kind){
   }catch(e){m.className="msg bad";m.textContent=e.message}
 }
 $$("#prodFields input,#prodFields textarea,#prodFields select,#c_domain,#c_life,#c_idle,#c_upd,#c_crit,#c_aemails,#c_agroups,#c_mode").forEach(e=>e.addEventListener("input",()=>$("#c_apply").classList.add("hide")));
-["c_emails","c_groups","c_domains","c_issuer"].forEach(i=>$("#"+i).addEventListener("input",cfgShow)); $("#c_mode").onchange=cfgShow; $("#c_domain").oninput=cfgShow; $("#c_provider").onchange=cfgShow;
+["c_emails","c_groups","c_domains","c_issuer"].forEach(i=>$("#"+i).addEventListener("input",cfgShow)); $("#c_mode").onchange=cfgShow; $("#c_domain").oninput=cfgShow; $("#c_ddns_sub").oninput=cfgShow; $("#c_provider").onchange=cfgShow;
 $("#actionCopy").onclick=async()=>{const t=$("#actionCode");try{await navigator.clipboard.writeText(t.value)}catch(e){t.select();document.execCommand("copy")}$("#actionCopy").textContent="Copied";setTimeout(()=>$("#actionCopy").textContent="Copy",1500)};
 $("#c_validate").onclick=()=>cfgAction("validate"); $("#c_save").onclick=()=>cfgAction("save");
 $("#c_show").onclick=()=>{const i=$("#c_secret");i.type=i.type==="password"?"text":"password";$("#c_show").textContent=i.type==="password"?"Show":"Hide"};
