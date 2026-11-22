@@ -365,6 +365,9 @@ def render_pomerium(c):
         "idp_provider": "oidc" if dev else c["provider"],
         **idp,
         "cookie_expire": c["lifetime"],
+        # One session cookie for the main, authenticate. and admin. hosts. By default each host gets its own, so signing
+        # out (or switching account) on the main site left the admin site signed in as the previous person.
+        "cookie_domain": c["domain"],
         "jwt_claims_headers": {"X-Pomerium-Claim-Email": "email"},
         "routes": [{
             "from": f"https://{c['domain']}",
