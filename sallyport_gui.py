@@ -726,7 +726,7 @@ class Handler(BaseHTTPRequestHandler):
             is_cfg = path.startswith("/api/config")
             name = "sallyport.yaml" if is_cfg else "targets.yaml"
             payload = body.get("data") if is_cfg else body.get("targets")
-            if (is_cfg and not isinstance(payload, dict)) or (not is_cfg and not isinstance(payload, list)):
+            if not isinstance(payload, dict):
                 return self.deny(400, "bad request")
             text = build_config_yaml(payload) if is_cfg else build_targets_yaml(payload)
             ok, msg = validate_text(name, text)
