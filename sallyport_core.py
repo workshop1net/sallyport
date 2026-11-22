@@ -385,6 +385,16 @@ def render_pomerium(c):
         # The admin site: its own host name, its own (much shorter) allow-list. pass_identity_headers makes
         # Pomerium sign the user's identity (X-Pomerium-Jwt-Assertion) with SIGNING_KEY, which the admin
         # service verifies itself rather than trusting a plain header.
+        # After /.pomerium/sign_out Pomerium redirects to signout_redirect_url. That is a public path on the admin
+        # service (no login needed, nothing to read) which serves a Sallyport-branded "signed out" page. This is
+        # listed first so it wins over the admin route's catch-all path.
+        config["signout_redirect_url"] = f"https://admin.{c['domain']}/signed-out"
+        config["routes"].insert(0, {
+            "from": f"https://admin.{c['domain']}",
+            "path": "/signed-out",
+            "to": "http://admin:8080",
+            "allow_public_unauthenticated_access": True,
+        })
         config["routes"].append({
             "from": f"https://admin.{c['domain']}",
             "to": "http://admin:8080",

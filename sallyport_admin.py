@@ -233,6 +233,9 @@ class Handler(BaseHTTPRequestHandler):
         return me
 
     def handle_request(self, post):
+        if not post and self.path.split("?")[0] == "/signed-out":
+            # Public on purpose: Pomerium sends people here after sign-out. Nothing on it depends on who asks.
+            return self.send(200, SIGNED_OUT_PAGE.replace("__MAIN__", html_escape(self.main_url)), "text/html")
         try:
             me = self.guard(post)
             path = self.path.split("?")[0]
@@ -282,6 +285,17 @@ class NotAdmin(Exception):
 
 def html_escape(text):
     return (text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;"))
+
+
+SIGNED_OUT_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Signed out - Sallyport</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>body{font:16px/1.5 system-ui,sans-serif;max-width:30em;margin:14vh auto;padding:0 16px;text-align:center;color-scheme:light dark}
+.bar{display:inline-flex;gap:8px;align-items:center;background:#17324d;color:#fff;font-weight:600;padding:8px 18px;border-radius:8px}
+a.b{display:inline-block;margin-top:14px;padding:8px 18px;background:#17324d;color:#fff;border-radius:6px;text-decoration:none}</style></head>
+<body><div class="bar"><svg width="18" height="18" viewBox="0 0 16 16" aria-hidden="true"><path fill="none" stroke="#fff" stroke-width="1.6"
+d="M2 15V7a6 6 0 0 1 12 0v8M5.5 15V8M8 15V3M10.5 15V8M2 11.5h12"/></svg>Sallyport</div>
+<h1>You have been signed out</h1><p>Your session has ended. Close this window, or sign in again.</p>
+<a class="b" href="__MAIN__">Sign in again</a></body></html>"""
 
 
 DENIED_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Sallyport</title>
