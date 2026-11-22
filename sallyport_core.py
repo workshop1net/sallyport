@@ -57,7 +57,7 @@ CLAIM_RE = re.compile(r"^[A-Za-z0-9_:./-]{1,64}$")
 AUTH0_DOMAIN_RE = re.compile(r"^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?\.[a-z]{2,63}$")
 PROVIDERS = ("oidc", "auth0", "google")
 AUTH0_GROUPS_CLAIM = "pomerium.io/groups"  # the claim name Pomerium's Auth0 guide uses
-NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}$")
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._()@+,-]{0,199}$")
 HOST_RE = re.compile(r"^[A-Za-z0-9._:-]{1,253}$")
 
 
@@ -445,7 +445,7 @@ def cmd_init(args):
 
 RDP_SECURITY = {"nla", "tls", "rdp", "any"}
 CLIPBOARD = {"both", "none", "paste-only", "copy-only"}
-COMMON_KEYS = {"name", "protocol", "host", "port", "username", "password", "clipboard", "max_sessions"}
+COMMON_KEYS = {"name", "protocol", "host", "port", "username", "password", "clipboard", "max_sessions", "users"}
 PROTOCOL_KEYS = {
     "rdp": COMMON_KEYS | {"domain", "security", "ignore_cert"},
     "ssh": COMMON_KEYS | {"private_key", "passphrase", "host_key"},
@@ -456,6 +456,27 @@ SECRET_PARAMS = {"password", "private-key", "passphrase"}
 def q(value):
     """SQL string literal. Targets are validated; values are escaped by doubling quotes."""
     return "'" + str(value).replace("'", "''") + "'"
+
+
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def target_users(t):
+    """None = every user (default group); a list = only those people (may be empty = nobody)."""
+    if "users" not in t:
+        return None
+    users = t["users"]
+    section = f"target '{t['name']}'"
+    if not isinstance(users, list):
+        die(f"{section}: users must be a list of email addresses")
+    out = []
+    for u in users:
+        if not isinstance(u, str) or not EMAIL_RE.match(u.strip()) or len(u) > 128 or "'" in u:
+            die(f"{section}: users: '{u}' is not an email address")
+        u = u.strip().lower()
+        if u not in out:
+            out.append(u)
+    return out
 
 
 def target_params(t):
@@ -484,8 +505,7 @@ def target_params(t):
                    ("enable-printing", "false"), ("resize-method", "display-update")]
         if "domain" in t:
             params.append(("domain", nonempty_str(section, "domain", t["domain"], 256)))
-        if "username" not in t or "password" not in t:
-            die(f"{section}: rdp targets need username and password")
+        # username and password are optional: whatever is missing, Guacamole asks the user for at connect time
     elif proto == "ssh":
         params.append(("enable-sftp", "false"))
         if "private_key" in t:
@@ -494,10 +514,11 @@ def target_params(t):
                 params.append(("passphrase", nonempty_str(section, "passphrase", t["passphrase"])))
         if "host_key" in t:
             params.append(("host-key", nonempty_str(section, "host_key", t["host_key"])))
-        if "username" not in t:
-            die(f"{section}: ssh targets need a username")
-        if "password" not in t and "private_key" not in t:
-            die(f"{section}: ssh targets need a password or private_key")
+        # username, password and key are optional: whatever is missing, Guacamole asks the user at connect time
+        if "private_key" in t and "username" not in t:
+            die(f"{section}: a private_key needs a username")
+        if "passphrase" in t and "private_key" not in t:
+            die(f"{section}: passphrase needs a private_key")
 
     clipboard = t.get("clipboard", "both")
     if clipboard not in CLIPBOARD:
@@ -542,12 +563,39 @@ def build_sql(targets, redact=False):
             "SELECT c.connection_id, p.n, p.v FROM guacamole_connection c,\n"
             f"(VALUES {', '.join(rows)}) AS p(n, v)\n"
             f"WHERE c.connection_name = {n} AND c.parent_id IS NULL;")
+        # Permissions are rebuilt on every load, so narrowing a target takes effect.
         out.append(
-            "INSERT INTO guacamole_connection_permission (entity_id, connection_id, permission)\n"
-            "SELECT e.entity_id, c.connection_id, 'READ'::guacamole_object_permission_type\n"
-            "FROM guacamole_entity e, guacamole_connection c\n"
-            f"WHERE e.name = {q(DEFAULT_GROUP)} AND e.type = 'USER_GROUP' AND c.connection_name = {n} AND c.parent_id IS NULL\n"
-            "ON CONFLICT DO NOTHING;")
+            "DELETE FROM guacamole_connection_permission WHERE connection_id IN "
+            f"(SELECT connection_id FROM guacamole_connection WHERE {where});")
+        users = target_users(t)
+        if users is None:
+            out.append(
+                "INSERT INTO guacamole_connection_permission (entity_id, connection_id, permission)\n"
+                "SELECT e.entity_id, c.connection_id, 'READ'::guacamole_object_permission_type\n"
+                "FROM guacamole_entity e, guacamole_connection c\n"
+                f"WHERE e.name = {q(DEFAULT_GROUP)} AND e.type = 'USER_GROUP' AND c.connection_name = {n} AND c.parent_id IS NULL\n"
+                "ON CONFLICT DO NOTHING;")
+        elif users:
+            listed = ", ".join(q(u) for u in users)
+            vals = ", ".join(f"({q(u)})" for u in users)
+            # Create the account ahead of the person's first login so the permission can be granted now.
+            # The password hash is random and unknowable: these accounts only ever log in via Pomerium.
+            out.append(
+                "INSERT INTO guacamole_entity (name, type)\n"
+                f"SELECT v.u, 'USER'::guacamole_entity_type FROM (VALUES {vals}) v(u)\n"
+                "WHERE NOT EXISTS (SELECT 1 FROM guacamole_entity x WHERE x.name = v.u AND x.type = 'USER');")
+            out.append(
+                "INSERT INTO guacamole_user (entity_id, password_hash, password_salt, password_date)\n"
+                "SELECT e.entity_id, sha256(convert_to(random()::text || clock_timestamp()::text || e.name, 'UTF8')),\n"
+                "       sha256(convert_to(clock_timestamp()::text || random()::text, 'UTF8')), now()\n"
+                f"FROM guacamole_entity e WHERE e.type = 'USER' AND e.name IN ({listed})\n"
+                "AND NOT EXISTS (SELECT 1 FROM guacamole_user x WHERE x.entity_id = e.entity_id);")
+            out.append(
+                "INSERT INTO guacamole_connection_permission (entity_id, connection_id, permission)\n"
+                "SELECT e.entity_id, c.connection_id, 'READ'::guacamole_object_permission_type\n"
+                "FROM guacamole_entity e, guacamole_connection c\n"
+                f"WHERE e.type = 'USER' AND e.name IN ({listed}) AND c.connection_name = {n} AND c.parent_id IS NULL\n"
+                "ON CONFLICT DO NOTHING;")
     # Sallyport owns all top-level connections: anything not in targets.yaml is removed.
     if names:
         listed = ", ".join(q(n) for n in names)
@@ -572,7 +620,7 @@ def load_targets(data=None):
                    required=("name", "protocol", "host"))
         name = t["name"]
         if not isinstance(name, str) or not NAME_RE.match(name):
-            die(f"target name '{name}' must start with a letter or digit and use letters, digits, space . _ -")
+            die(f"target name '{name}' must start with a letter or digit and use letters, digits, space and . _ - ( ) @ + ,")
         if name in seen:
             die(f"duplicate target name '{name}'")
         seen.add(name)
@@ -582,11 +630,16 @@ def load_targets(data=None):
         extra = set(t) - PROTOCOL_KEYS[proto]
         if extra:
             die(f"target '{name}': {sorted(extra)} do not apply to {proto}")
+        target_users(t)
     return targets
 
 
 def cmd_load_targets(args):
     targets = load_targets()
+    everyone = [t["name"] for t in targets if "users" not in t]
+    if everyone:
+        print(f"note: {len(everyone)} target(s) are open to EVERY user who can log in, including anyone you add later: "
+              + ", ".join(everyone))
     if args.dry_run:
         print(build_sql(targets, redact=True))
         return

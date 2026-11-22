@@ -6,6 +6,15 @@
 # dedicated service accounts with least privilege, never personal credentials.
 #
 # Unknown keys are rejected on purpose, so a typo cannot silently weaken a setting.
+#
+# Who sees a target:
+#   users: [a@example.com]   only these people (lower-case email, as the IdP reports it)
+#   users: []                nobody (the GUI uses this to keep a system with no access entries)
+#   (no users line)          EVERYONE who can log in, including anyone added later. Use sparingly.
+# Connection names must be unique, so one system for several people is several entries, e.g.
+# "dc01 (alice@example.com)" and "dc01 (bob@example.com)", each with that person's own credentials.
+# username/password/private_key are optional: leave them out and Guacamole asks the user
+# for credentials when they connect.
 
 targets:
   - name: dc01
@@ -21,7 +30,8 @@ targets:
                            # on the path between guacd and the target
     clipboard: both        # both (default) | none | paste-only | copy-only
                            # paste-only: user to target; copy-only: target to user
-    max_sessions: 1        # simultaneous sessions on this target, all users
+    max_sessions: 1        # simultaneous sessions on this connection
+    # users: [alice@example.com]
 
   - name: fw01
     protocol: ssh

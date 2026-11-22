@@ -801,6 +801,11 @@ textarea.small{height:70px;font:12.5px/1.4 Consolas,monospace}
 .tlist{border:1px solid var(--bd);border-radius:6px;min-height:120px;max-height:320px;overflow:auto}
 .tlist div{padding:6px 8px;cursor:pointer;border-bottom:1px solid var(--bd)}.tlist div.on{background:#4a90d933;font-weight:600}
 .tlist small{opacity:.7;display:block}
+.acc{border:1px solid var(--bd);border-radius:6px;padding:8px 10px;margin:8px 0}
+.acc.open{border-color:#c62828;background:#c6282814}
+.acc .hint{color:#b26a00;font-size:.9em;margin:2px 0 4px}
+.acc .grid{margin:4px 0}
+h3{margin:14px 0 4px;font-size:1em}
 .hide{display:none!important}
 .maintabs{display:flex;gap:2px;border-bottom:2px solid var(--bd);margin:6px 0 14px}
 .maintabs button{border:1px solid var(--bd);border-bottom:none;border-radius:6px 6px 0 0;background:none;color:inherit;padding:8px 16px;margin-bottom:-2px}
@@ -877,27 +882,29 @@ details summary{cursor:pointer;margin-bottom:8px}
 <div id="tab_targets" class="tabpanel hide">
 <section><h2>Targets</h2>
 <div class="sub" id="tstatus"></div>
+<div id="openwarn" class="banner bad hide"></div>
+<div class="sub">A <b>system</b> is a machine people can connect to. Each system has <b>access entries</b>: who may use it, and whether they get saved credentials or are asked for their own when they connect. Adding someone to your identity provider (and to Allowed emails in Settings) lets them log in, but they only see systems that have an access entry for them, or an entry for everyone.</div>
 <div class="targets">
 <div><div id="tlist" class="tlist"></div>
-<div class="row"><button id="t_add">Add</button><button id="t_dup">Duplicate</button><button id="t_del">Delete</button></div></div>
-<div id="tform" class="grid">
+<div class="row"><button id="t_add">Add system</button><button id="t_del">Delete system</button></div></div>
+<div id="tform">
+<div class="grid">
 <label for="t_name">Name</label><input type="text" id="t_name">
 <label for="t_protocol">Protocol</label><select id="t_protocol"><option>rdp</option><option>ssh</option></select>
 <label for="t_host">Host</label><input type="text" id="t_host" placeholder="10.0.0.10 or server.corp">
 <label for="t_port">Port</label><input type="text" id="t_port" placeholder="default for the protocol">
-<label for="t_username">Username</label><input type="text" id="t_username" autocomplete="off">
-<label for="t_password">Password</label><span class="row"><input type="password" id="t_password" autocomplete="off"><button type="button" id="t_show">Show</button></span>
-<label class="rdp" for="t_domain">Windows domain</label><input class="rdp" type="text" id="t_domain" placeholder="optional">
 <label class="rdp" for="t_security">RDP security</label><select class="rdp" id="t_security"><option>nla</option><option>tls</option><option>rdp</option><option>any</option></select>
 <label class="rdp" for="t_ignore_cert">Skip certificate check</label><span class="rdp"><input type="checkbox" id="t_ignore_cert"> <span class="sub">allows interception between guacd and the target</span></span>
-<label class="ssh" for="t_private_key">Private key</label><textarea class="ssh small" id="t_private_key" spellcheck="false" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"></textarea>
-<label class="ssh" for="t_passphrase">Key passphrase</label><input class="ssh" type="password" id="t_passphrase" autocomplete="off">
 <label class="ssh" for="t_host_key">Host key</label><input class="ssh" type="text" id="t_host_key" placeholder="ssh-ed25519 AAAA... (strongly recommended)">
 <label for="t_clipboard">Clipboard</label><select id="t_clipboard"><option value="both">both ways</option><option value="none">none</option><option value="paste-only">paste only (you to target)</option><option value="copy-only">copy only (target to you)</option></select>
 <label for="t_max_sessions">Max sessions</label><input type="text" id="t_max_sessions" placeholder="1">
+</div>
+<h3>Who can use this system</h3>
+<div id="acc"></div>
+<div class="row"><button id="a_add">Add access</button><datalist id="knownUsers"></datalist></div>
 </div></div>
 <div class="row"><button id="t_validate">Validate</button><button id="t_save" class="p">Save targets</button><span id="tmsg" class="msg"></span><button id="t_apply" class="p hide" data-a="load_targets">Apply targets now</button></div>
-<div class="warn">Credentials are stored in plain text in targets.yaml and in the database. Use dedicated, least-privilege service accounts. File transfer and printing are always off. Saving changes nothing in the running system until you apply the targets (below).</div></section>
+<div class="warn">Saved credentials are stored in plain text in targets.yaml and in the database. Use dedicated, least-privilege accounts, ideally one per person so the target's own logs show who did what. File transfer and printing are always off. Saving changes nothing in the running system until you apply the targets (below). Each person's access entry becomes a separate connection named like <code>System (person@example.com)</code>; <b>Max sessions</b> applies to each connection separately.</div></section>
 
 <section><h2>Apply targets</h2>
 <div class="sub">Use this after you change targets above, and once after the first start. It copies <code>targets.yaml</code> into Guacamole, adding, changing and removing connections to match. No restart; sessions already open are not affected. The stack must be running.</div>
@@ -1100,51 +1107,140 @@ $("#actionCopy").onclick=async()=>{const t=$("#actionCode");try{await navigator.
 $("#c_validate").onclick=()=>cfgAction("validate"); $("#c_save").onclick=()=>cfgAction("save");
 $("#c_show").onclick=()=>{const i=$("#c_secret");i.type=i.type==="password"?"text":"password";$("#c_show").textContent=i.type==="password"?"Show":"Hide"};
 
-/* ---- targets editor ---- */
-const TF=["name","protocol","host","port","username","password","domain","security","private_key","passphrase","host_key","clipboard","max_sessions"];
-const KEYS={common:["name","protocol","host","port","username","password","clipboard","max_sessions"],rdp:["domain","security","ignore_cert"],ssh:["private_key","passphrase","host_key"]};
-let targets=[], sel=-1;
-const blank=()=>({name:"",protocol:"rdp",host:"",security:"nla",ignore_cert:false,clipboard:"both",max_sessions:1});
+/* ---- targets editor: systems, each with access entries ---- */
+const SYS=["name","protocol","host","port","security","host_key","clipboard","max_sessions"];
+let systems=[], sel=-1, cfgUsers={emails:[],groups:[]};
+const blankSys=()=>({name:"",protocol:"rdp",host:"",port:"",security:"nla",ignore_cert:false,host_key:"",clipboard:"both",max_sessions:1,access:[]});
+const blankAcc=()=>({who:"user",email:"",cred:"ask",username:"",password:"",domain:"",private_key:"",passphrase:""});
+function fromFile(list){
+  const map=new Map(), out=[];
+  for(const e of list){
+    const users=Array.isArray(e.users)?e.users:null; let name=String(e.name||"");
+    if(users&&users.length){const m=/^(.*) \(([^()]*)\)$/.exec(name); if(m&&m[2].startsWith(users[0]))name=m[1];}
+    const sys={name,protocol:e.protocol||"rdp",host:e.host||"",port:e.port??"",security:e.security||"nla",ignore_cert:!!e.ignore_cert,host_key:e.host_key||"",clipboard:e.clipboard||"both",max_sessions:e.max_sessions??1};
+    const key=JSON.stringify(sys); let t=map.get(key);
+    if(!t){t=Object.assign(sys,{access:[]});map.set(key,t);out.push(t)}
+    const saved=!!(e.username||e.password||e.private_key||e.passphrase);
+    const base={cred:saved?"saved":"ask",username:e.username||"",password:e.password||"",domain:e.domain||"",private_key:e.private_key||"",passphrase:e.passphrase||""};
+    if(!users)t.access.push(Object.assign(blankAcc(),base,{who:"all"}));
+    else for(const u of users)t.access.push(Object.assign(blankAcc(),base,{who:"user",email:u}));
+  }
+  return out;
+}
+function sysProps(s){
+  const o={protocol:s.protocol,host:s.host};
+  if(String(s.port).trim()!=="")o.port=s.port;
+  if(s.protocol==="rdp"){o.security=s.security;o.ignore_cert=!!s.ignore_cert}
+  else if(s.host_key)o.host_key=s.host_key;
+  o.clipboard=s.clipboard; if(String(s.max_sessions).trim()!=="")o.max_sessions=s.max_sessions;
+  return o;
+}
+function toFile(){
+  const out=[], names=new Set();
+  const mk=(name,s,extra)=>{
+    if(names.has(name.toLowerCase()))throw new Error("Two access entries would have the same name: "+name+". Each person can have only one entry per system, and a system only one 'everyone' entry.");
+    names.add(name.toLowerCase()); out.push(Object.assign({name},sysProps(s),extra));};
+  for(const s of systems){
+    if(!s.name.trim())throw new Error("A system has no name.");
+    if(!s.access.length)mk(s.name.trim(),s,{users:[]});
+    for(const a of s.access){
+      const cr={};
+      if(a.cred==="saved"){
+        for(const k of ["username","password"])if(a[k]!=="")cr[k]=a[k];
+        if(s.protocol==="rdp"&&a.domain)cr.domain=a.domain;
+        if(s.protocol==="ssh"){if(a.private_key)cr.private_key=a.private_key;if(a.passphrase)cr.passphrase=a.passphrase}
+      }
+      if(a.who==="all")mk(s.name.trim(),s,cr);
+      else{const em=a.email.trim().toLowerCase();
+        if(!em)throw new Error("An access entry on '"+s.name+"' has no person. Enter an email address or choose Everyone.");
+        mk(s.name.trim()+" ("+em+")",s,Object.assign({users:[em]},cr));}
+    }
+  }
+  return out;
+}
+const isOpen=s=>s.access.some(a=>a.who==="all");
+function userHint(em){
+  em=em.trim().toLowerCase(); if(!em||cfgUsers.groups.length)return "";
+  return cfgUsers.emails.includes(em)?"":"⚠ Not in Allowed emails (Settings tab), so this person cannot log in yet.";
+}
 function tShowFields(){const p=$("#t_protocol").value;
-  $$(".rdp").forEach(e=>e.classList.toggle("hide",p!=="rdp")); $$(".ssh").forEach(e=>e.classList.toggle("hide",p!=="ssh"));}
+  $$("#tform>.grid .rdp").forEach(e=>e.classList.toggle("hide",p!=="rdp")); $$("#tform>.grid .ssh").forEach(e=>e.classList.toggle("hide",p!=="ssh"));}
 function tFill(){
-  const t=targets[sel]; $("#tform").classList.toggle("hide",!t); if(!t)return;
-  for(const k of TF)$("#t_"+k).value=t[k]??(k==="clipboard"?"both":(k==="security"?"nla":""));
-  $("#t_ignore_cert").checked=!!t.ignore_cert; tShowFields();
+  const t=systems[sel]; $("#tform").classList.toggle("hide",!t); if(!t){renderAcc();return}
+  for(const k of SYS)$("#t_"+k).value=t[k]??"";
+  $("#t_ignore_cert").checked=!!t.ignore_cert; tShowFields(); renderAcc();
 }
 function tWrite(){
-  const t=targets[sel]; if(!t)return;
-  for(const k of TF)t[k]=$("#t_"+k).value; t.ignore_cert=$("#t_ignore_cert").checked; tShowFields(); tList();
+  const t=systems[sel]; if(!t)return;
+  const proto=t.protocol;
+  for(const k of SYS)t[k]=$("#t_"+k).value; t.ignore_cert=$("#t_ignore_cert").checked; tShowFields(); tList();
+  if(t.protocol!==proto)renderAcc();
 }
 function tList(){
   const box=$("#tlist"); box.textContent="";
-  targets.forEach((t,i)=>{const d=document.createElement("div"); d.className=i===sel?"on":"";
-    d.textContent=t.name||"(unnamed)"; const s=document.createElement("small"); s.textContent=(t.protocol||"")+" "+(t.host||""); d.appendChild(s);
+  systems.forEach((t,i)=>{const d=document.createElement("div"); d.className=i===sel?"on":"";
+    d.textContent=(isOpen(t)?"⚠ ":"")+(t.name||"(unnamed)"); const s=document.createElement("small");
+    s.textContent=t.protocol+" "+(t.host||"")+" · "+t.access.length+" access"; d.appendChild(s);
     d.onclick=()=>{sel=i;tList();tFill()}; box.appendChild(d);});
+  const open=systems.filter(isOpen).map(t=>t.name||"(unnamed)"), w=$("#openwarn");
+  w.classList.toggle("hide",!open.length);
+  w.textContent=open.length?"⚠ Open to everyone who can log in: "+open.join(", ")+". Anyone you add to your identity provider later gets access to these automatically. Give each person their own access entry instead if that is not what you want.":"";
 }
-function tSerialise(){
-  return targets.map(t=>{const o={},p=t.protocol||"rdp";
-    for(const k of KEYS.common.concat(KEYS[p]||[])){const v=t[k]; if(v===undefined||v===null||v==="")continue; o[k]=v;}
-    if(p==="rdp")o.ignore_cert=!!t.ignore_cert; return o;});
+function el(tag,cls,text){const e=document.createElement(tag);if(cls)e.className=cls;if(text!==undefined)e.textContent=text;return e}
+function addRow(grid,label,node){const l=el("label","",label);grid.appendChild(l);grid.appendChild(node);return node}
+function inp(a,k,type,ph){const i=el("input");i.type=type||"text";i.autocomplete="off";i.value=a[k];if(ph)i.placeholder=ph;i.oninput=()=>{a[k]=i.value};return i}
+function sel_(a,k,opts){const s=el("select");for(const [v,t] of opts){const o=el("option","",t);o.value=v;s.appendChild(o)}s.value=a[k];
+  s.onchange=()=>{a[k]=s.value;tList();renderAcc()};return s}
+function renderAcc(){
+  const s=systems[sel], box=$("#acc"); box.textContent=""; if(!s)return;
+  const known=new Set(cfgUsers.emails); systems.forEach(x=>x.access.forEach(a=>{if(a.email)known.add(a.email.trim().toLowerCase())}));
+  const dl=$("#knownUsers"); dl.textContent=""; known.forEach(u=>{const o=el("option");o.value=u;dl.appendChild(o)});
+  if(!s.access.length)box.appendChild(el("div","sub","No access entries: nobody can see this system yet. Add one."));
+  s.access.forEach((a,i)=>{
+    const card=el("div","acc"+(a.who==="all"?" open":"")), g=el("div","grid");
+    addRow(g,"Who",sel_(a,"who",[["user","One person"],["all","Everyone who can log in"]]));
+    if(a.who==="user"){
+      const em=inp(a,"email","text","person@example.com"); em.setAttribute("list","knownUsers");
+      const hint=el("div","hint",userHint(a.email)); em.oninput=()=>{a.email=em.value;hint.textContent=userHint(em.value)};
+      addRow(g,"Email",em); card.appendChild(g); card.appendChild(hint);
+    }else{
+      card.appendChild(g);
+      card.appendChild(el("div","hint","⚠ Everyone who can log in gets this system, including anyone you add later."));
+    }
+    const g2=el("div","grid");
+    addRow(g2,"Credentials",sel_(a,"cred",[["ask","Ask them when they connect"],["saved","Use saved credentials"]]));
+    if(a.cred==="saved"){
+      addRow(g2,"Username",inp(a,"username"));
+      addRow(g2,"Password",inp(a,"password","password"));
+      if(s.protocol==="rdp")addRow(g2,"Windows domain",inp(a,"domain","text","optional"));
+      else{const ta=el("textarea","small");ta.spellcheck=false;ta.value=a.private_key;ta.placeholder="-----BEGIN OPENSSH PRIVATE KEY----- (optional)";ta.oninput=()=>{a.private_key=ta.value};
+        addRow(g2,"Private key",ta);addRow(g2,"Key passphrase",inp(a,"passphrase","password"))}
+    }
+    card.appendChild(g2);
+    const r=el("div","row"),rm=el("button","","Remove access");rm.onclick=()=>{s.access.splice(i,1);tList();renderAcc()};r.appendChild(rm);card.appendChild(r);
+    box.appendChild(card);
+  });
 }
 async function loadTargets(){
-  const r=await api("/api/targets"); targets=(r.data||[]).map(t=>Object.assign(blank(),t)); sel=targets.length?0:-1; tList(); tFill();
-  $("#tstatus").textContent=!r.exists?"No targets.yaml yet. Add a target and save.":"Current file: "+r.status;
+  const r=await api("/api/targets"); systems=fromFile(r.data||[]); sel=systems.length?0:-1;
+  try{const c=await api("/api/config"); const d=c.data||{};
+    cfgUsers={emails:(d.emails||[]).map(x=>String(x).toLowerCase()),groups:d.groups||[]}}catch(e){}
+  tList(); tFill();
+  $("#tstatus").textContent=!r.exists?"No targets.yaml yet. Add a system and save.":"Current file: "+r.status;
 }
 async function tAction(kind){
   const m=$("#tmsg");
-  try{await folderSet(); const r=await api("/api/targets/"+kind,{targets:tSerialise()});
+  try{const targets=toFile(); await folderSet(); const r=await api("/api/targets/"+kind,{targets});
     m.className="msg "+(r.ok?"ok":"bad"); m.textContent=(r.ok?"✔ ":"✘ ")+r.message;
     if(kind==="save"&&r.saved){await loadFile();$("#tstatus").textContent="Saved.";$("#t_apply").classList.remove("hide")}
-  }catch(e){m.className="msg bad";m.textContent=e.message}
+  }catch(e){m.className="msg bad";m.textContent="✘ "+e.message}
 }
-$$("#tform input,#tform select,#tform textarea").forEach(e=>{e.oninput=tWrite;e.onchange=tWrite});
+$$("#tform>.grid input,#tform>.grid select").forEach(e=>{e.oninput=tWrite;e.onchange=tWrite});
 $("#tform").addEventListener("input",()=>$("#t_apply").classList.add("hide"));
-$("#t_add").onclick=()=>{targets.push(blank());sel=targets.length-1;tList();tFill();$("#t_name").focus()};
-$("#t_dup").onclick=()=>{if(sel<0)return;const c=JSON.parse(JSON.stringify(targets[sel]));c.name=(c.name||"target")+"-copy";targets.push(c);sel=targets.length-1;tList();tFill()};
-$("#t_del").onclick=()=>{if(sel<0)return;if(!confirm("Delete target \""+(targets[sel].name||"unnamed")+"\"? (Not final until you press Save targets.)"))return;targets.splice(sel,1);sel=Math.min(sel,targets.length-1);tList();tFill()};
+$("#t_add").onclick=()=>{systems.push(blankSys());sel=systems.length-1;tList();tFill();$("#t_name").focus()};
+$("#a_add").onclick=()=>{const s=systems[sel];if(!s)return;s.access.push(blankAcc());tList();renderAcc()};
+$("#t_del").onclick=()=>{if(sel<0)return;if(!confirm("Delete system \""+(systems[sel].name||"unnamed")+"\" and all its access entries? (Not final until you press Save targets.)"))return;systems.splice(sel,1);sel=Math.min(sel,systems.length-1);tList();tFill()};
 $("#t_validate").onclick=()=>tAction("validate"); $("#t_save").onclick=()=>tAction("save");
-$("#t_show").onclick=()=>{const i=$("#t_password");i.type=i.type==="password"?"text":"password";$("#t_show").textContent=i.type==="password"?"Show":"Hide"};
 async function loadForms(){await loadCfg();await loadTargets()}
 
 setInterval(()=>api("/api/ping").catch(()=>{}),20000);
