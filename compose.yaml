@@ -86,6 +86,9 @@ services:
       HTTP_AUTH_HEADER: X-Pomerium-Claim-Email
       WEBAPP_CONTEXT: ROOT
       REMOTE_IP_VALVE_ENABLED: "true"
+    volumes:
+      # Sallyport branding and the link to the admin site (built by ./sallyport init).
+      - ./generated/sallyport-branding.jar:/etc/guacamole/extensions/sallyport-branding.jar:ro
     networks: [internal]
     security_opt:
       - no-new-privileges:true
