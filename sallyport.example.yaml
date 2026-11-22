@@ -68,3 +68,4 @@ admin:
 # Apply with: ./sallyport schedule apply   (read the README section on the risks first)
 # updates:
 #   schedule: "03:00"
+#   critical: true   # also check hourly for an update flagged critical upstream and apply it at once

@@ -129,13 +129,21 @@ def parse_schedule(cfg):
     updates = cfg.get("updates") or {}
     if not isinstance(updates, dict):
         die("updates must be a mapping")
-    check_keys("updates", updates, {"schedule"})
+    check_keys("updates", updates, {"schedule", "critical"})
+    if not isinstance(updates.get("critical", True), bool):
+        die("updates.critical must be true or false")
     value = updates.get("schedule")
     if value in (None, "", False):
         return ""
     if not isinstance(value, str) or not SCHEDULE_RE.match(value):
         die("updates.schedule must be a quoted 24-hour time such as \"03:00\" (unquoted, YAML reads 03:00 as a number)")
     return value
+
+
+def parse_critical(cfg):
+    """Whether the hourly check for a flagged critical update is on (default on, when a schedule is set)."""
+    updates = cfg.get("updates") or {}
+    return bool(updates.get("critical", True)) if isinstance(updates, dict) else True
 
 
 def parse_admin(cfg):
@@ -170,7 +178,7 @@ def validate_dev(cfg):
     lifetime, idle = parse_session(cfg)
     return {"mode": "dev", "domain": domain, "emails": [e for e, _ in DEV_USERS], "groups": [], "groups_claim": "groups",
             "domains": [], "open_idp": False, "admin_emails": [DEV_EMAIL], "admin_groups": [],
-            "update_time": parse_schedule(cfg),
+            "update_time": parse_schedule(cfg), "critical": parse_critical(cfg),
             "lifetime": lifetime, "idle": idle, "client_secret": None}
 
 
@@ -299,7 +307,7 @@ def validate_config(cfg):
         die("Google does not provide group claims; list people under admin.emails instead")
 
     return {
-        "admin_emails": admin_emails, "admin_groups": admin_groups, "update_time": parse_schedule(cfg),
+        "admin_emails": admin_emails, "admin_groups": admin_groups, "update_time": parse_schedule(cfg), "critical": parse_critical(cfg),
         "ddns": ddns, "mode": "production", "domain": domain, "acme_email": email, "staging": staging,
         "provider": provider, "issuer": issuer, "client_id": idp["client_id"], "client_secret": idp["client_secret"],
         "scopes": scopes, "emails": [e.strip() for e in emails], "groups": groups,
@@ -1268,11 +1276,68 @@ def helper(*args):
     return [sys.executable, "-I", str(ROOT / "sallyport"), *args]
 
 
+CRITICAL_FILE = "CRITICAL_UPDATE.json"
+CRITICAL_RETRY_HOURS = 6
+
+
+def critical_state_path():
+    return GEN / "critical-update.json"
+
+
+def critical_pending():
+    """The id of a critical update flagged in the upstream repository that has not been applied (and was not
+    attempted in the last few hours), else ''. Fetches quietly and changes nothing but the git remote refs."""
+    if not (ROOT / ".git").exists():
+        return ""
+    run = lambda *a: subprocess.run(["git", *a], cwd=ROOT, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
+    try:
+        if run("fetch", "--quiet").returncode != 0:
+            return ""
+        r = run("show", f"@{{u}}:{CRITICAL_FILE}")
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    if r.returncode != 0:
+        return ""
+    try:
+        cid = str(json.loads(r.stdout).get("id", ""))
+    except (ValueError, AttributeError):
+        return ""
+    if not re.match(r"^[A-Za-z0-9._-]{1,100}$", cid):
+        return ""
+    try:
+        st = json.loads(critical_state_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        st = {}
+    if st.get("id") == cid:
+        if st.get("applied"):
+            return ""
+        import datetime
+        try:
+            last = datetime.datetime.fromisoformat(st.get("attempted", ""))
+            if datetime.datetime.now().astimezone() - last < datetime.timedelta(hours=CRITICAL_RETRY_HOURS):
+                return ""  # a failed, rolled-back attempt: do not hammer the stack every hour
+        except ValueError:
+            pass
+    return cid
+
+
+def mark_critical(cid, applied):
+    GEN.mkdir(exist_ok=True)
+    write_text(critical_state_path(), json.dumps({"id": cid, "applied": applied, "attempted": now_iso()}))
+
+
 def cmd_update(args):
     """Fetch the latest code and images, recreate what changed, migrate the database, check the stack is healthy,
     and roll back if it is not. Safe to run unattended; does nothing when there is nothing new."""
-    log = UpdateLog()
     unattended = getattr(args, "unattended", False)
+    critical_id = ""
+    if getattr(args, "critical_only", False):
+        critical_id = critical_pending()
+        if not critical_id:
+            return  # nothing flagged: stay silent, this runs every hour
+    log = UpdateLog()
+    if critical_id:
+        log(f"CRITICAL UPDATE flagged upstream ({critical_id}): applying now, which interrupts any active sessions")
     lock = acquire_update_lock()
     if lock is None:
         log("another update is already running; nothing done")
@@ -1310,6 +1375,8 @@ def cmd_update(args):
         if not (moved or changed_images or config_changed):
             log("already up to date")
             write_update_status(ok=True, changed=False, summary="Already up to date.", unattended=unattended)
+            if critical_id:
+                mark_critical(critical_id, True)
             return
         _, end_sha = sh(log, ["git", "rev-parse", "--short", "HEAD"], timeout=20)
         log(f"applying: code {'updated' if moved else 'unchanged'}, images changed: {', '.join(changed_images) or 'none'}, "
@@ -1330,6 +1397,8 @@ def cmd_update(args):
         summary = f"Updated to {end_sha}." if moved else "Updated container images or configuration."
         log(summary)
         write_update_status(ok=True, changed=True, summary=summary, unattended=unattended)
+        if critical_id:
+            mark_critical(critical_id, True)
     except UpdateFailed as e:
         log(f"UPDATE FAILED: {e}")
         rolled = False
@@ -1348,6 +1417,8 @@ def cmd_update(args):
             except Exception as e2:  # keep the original failure the headline
                 log(f"rollback error: {e2}")
         write_update_status(ok=False, changed=moved, summary=f"Update failed: {e}", rolled_back=rolled, unattended=unattended)
+        if critical_id:
+            mark_critical(critical_id, False)
         raise SystemExit(f"error: update failed: {e}" + (" (rolled back)" if rolled else ""))
     finally:
         try:
@@ -1359,32 +1430,39 @@ def cmd_update(args):
 # ---------------------------------------------------------- scheduled updates
 
 SCHEDULE_NAME = "Sallyport update"
+CRITICAL_NAME = "Sallyport critical update check"
 CRON_MARK = "# sallyport-update"
 
 
-def update_argv():
-    return [sys.executable, "-I", str(ROOT / "sallyport"), "update", "--unattended"]
+def update_argv(critical=False):
+    return [sys.executable, "-I", str(ROOT / "sallyport"), "update", "--unattended"] + (["--critical-only"] if critical else [])
 
 
-def cron_line(hhmm):
+def cron_line(hhmm, critical=False):
     import shlex
     hh, mm = hhmm.split(":")
-    cmd = " ".join(shlex.quote(a) for a in update_argv())
-    return f"{int(mm)} {int(hh)} * * * cd {shlex.quote(str(ROOT))} && {cmd} >> {shlex.quote(str(GEN / 'update-cron.log'))} 2>&1 {CRON_MARK}"
+    cmd = " ".join(shlex.quote(a) for a in update_argv(critical))
+    when = f"{(int(mm) + 17) % 60} * * * *" if critical else f"{int(mm)} {int(hh)} * * *"  # hourly, off the hour
+    mark = CRON_MARK + ("-critical" if critical else "")
+    return f"{when} cd {shlex.quote(str(ROOT))} && {cmd} >> {shlex.quote(str(GEN / 'update-cron.log'))} 2>&1 {mark}"
 
 
-def systemd_units(hhmm, user):
+def systemd_units(hhmm, user, critical=False):
     import shlex
-    cmd = " ".join(shlex.quote(a) for a in update_argv())
-    service = ("[Unit]\nDescription=Sallyport unattended update\nAfter=docker.service network-online.target\n\n"
+    cmd = " ".join(shlex.quote(a) for a in update_argv(critical))
+    what = "critical update check" if critical else "unattended update"
+    service = (f"[Unit]\nDescription=Sallyport {what}\nAfter=docker.service network-online.target\n\n"
                f"[Service]\nType=oneshot\nUser={user}\nWorkingDirectory={ROOT}\nExecStart={cmd}\n")
-    timer = ("[Unit]\nDescription=Sallyport unattended update, daily\n\n"
-             f"[Timer]\nOnCalendar=*-*-* {hhmm}:00\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n")
+    when = "OnCalendar=hourly\nRandomizedDelaySec=600\n" if critical else f"OnCalendar=*-*-* {hhmm}:00\n"
+    timer = (f"[Unit]\nDescription=Sallyport {what}, {'hourly' if critical else 'daily'}\n\n"
+             f"[Timer]\n{when}Persistent=true\n\n[Install]\nWantedBy=timers.target\n")
     return service, timer
 
 
-def schtasks_create_args(hhmm):
-    tr = subprocess.list2cmdline(update_argv())
+def schtasks_create_args(hhmm, critical=False):
+    tr = subprocess.list2cmdline(update_argv(critical))
+    if critical:
+        return ["schtasks", "/Create", "/F", "/TN", CRITICAL_NAME, "/SC", "HOURLY", "/MO", "1", "/ST", f"00:{(int(hhmm[3:]) + 17) % 60:02d}", "/TR", tr]
     return ["schtasks", "/Create", "/F", "/TN", SCHEDULE_NAME, "/SC", "DAILY", "/ST", hhmm, "/TR", tr]
 
 
@@ -1409,15 +1487,17 @@ def set_crontab(lines):
 
 def schedule_remove():
     if os.name == "nt":
-        subprocess.run(["schtasks", "/Delete", "/F", "/TN", SCHEDULE_NAME], capture_output=True)
+        for name in (SCHEDULE_NAME, CRITICAL_NAME):
+            subprocess.run(["schtasks", "/Delete", "/F", "/TN", name], capture_output=True)
     elif use_systemd() or Path("/etc/systemd/system/sallyport-update.timer").exists():
-        if have("systemctl"):
-            subprocess.run(["systemctl", "disable", "--now", "sallyport-update.timer"], capture_output=True)
-        for n in ("sallyport-update.timer", "sallyport-update.service"):
-            try:
-                (Path("/etc/systemd/system") / n).unlink()
-            except OSError:
-                pass
+        for unit in ("sallyport-update", "sallyport-critical"):
+            if have("systemctl"):
+                subprocess.run(["systemctl", "disable", "--now", unit + ".timer"], capture_output=True)
+            for n in (unit + ".timer", unit + ".service"):
+                try:
+                    (Path("/etc/systemd/system") / n).unlink()
+                except OSError:
+                    pass
         if have("systemctl"):
             subprocess.run(["systemctl", "daemon-reload"], capture_output=True)
     if os.name != "nt" and have("crontab"):
@@ -1426,25 +1506,29 @@ def schedule_remove():
             set_crontab([ln for ln in lines if CRON_MARK not in ln])
 
 
-def schedule_install(hhmm):
+def schedule_install(hhmm, critical=True):
     schedule_remove()
     if os.name == "nt":
-        r = subprocess.run(schtasks_create_args(hhmm), capture_output=True, text=True)
-        if r.returncode != 0:
-            die("schtasks failed: " + (r.stderr or r.stdout).strip())
+        for crit in ([False, True] if critical else [False]):
+            r = subprocess.run(schtasks_create_args(hhmm, crit), capture_output=True, text=True)
+            if r.returncode != 0:
+                die("schtasks failed: " + (r.stderr or r.stdout).strip())
         return "Windows Task Scheduler (runs while you are signed in, because Docker Desktop does)"
     if use_systemd():
         import pwd
         user = pwd.getpwuid(ROOT.stat().st_uid).pw_name
-        service, timer = systemd_units(hhmm, user)
-        Path("/etc/systemd/system/sallyport-update.service").write_text(service)
-        Path("/etc/systemd/system/sallyport-update.timer").write_text(timer)
+        units = ["sallyport-update"] + (["sallyport-critical"] if critical else [])
+        for unit in units:
+            service, timer = systemd_units(hhmm, user, unit.endswith("critical"))
+            Path(f"/etc/systemd/system/{unit}.service").write_text(service)
+            Path(f"/etc/systemd/system/{unit}.timer").write_text(timer)
         subprocess.run(["systemctl", "daemon-reload"], check=True)
-        subprocess.run(["systemctl", "enable", "--now", "sallyport-update.timer"], check=True)
+        for unit in units:
+            subprocess.run(["systemctl", "enable", "--now", unit + ".timer"], check=True)
         return f"a systemd timer, running as {user}"
     if not have("crontab"):
         die("no scheduler found: run as root on a systemd host, or install cron")
-    set_crontab(crontab_lines() + [cron_line(hhmm)])
+    set_crontab(crontab_lines() + [cron_line(hhmm)] + ([cron_line(hhmm, True)] if critical else []))
     return "your user crontab"
 
 
@@ -1472,8 +1556,10 @@ def cmd_schedule(args):
         return
     if not c["update_time"]:
         die("set updates.schedule (for example \"03:00\") in sallyport.yaml first")
-    where = schedule_install(c["update_time"])
+    where = schedule_install(c["update_time"], c["critical"])
     print(f"scheduled an unattended update every day at {c['update_time']} (this computer's local time) using {where}")
+    print("also checking hourly for an update flagged critical, which is applied immediately, interrupting sessions"
+          if c["critical"] else "hourly critical-update check is off (updates.critical: false)")
 
 
 
@@ -1487,6 +1573,7 @@ def main():
     p.set_defaults(func=cmd_init)
     p = sub.add_parser("update", help="pull the latest code and images, recreate what changed, check health, roll back on failure")
     p.add_argument("--unattended", action="store_true", help="for scheduled runs: exit quietly if another update is running")
+    p.add_argument("--critical-only", action="store_true", help="only update if the repository flags a critical update not yet applied")
     p.set_defaults(func=cmd_update)
     p = sub.add_parser("schedule", help="install, remove or show the scheduled unattended update")
     p.add_argument("action", choices=["apply", "remove", "status"], help="apply installs or removes it to match updates.schedule")

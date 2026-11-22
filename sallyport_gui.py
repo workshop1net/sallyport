@@ -561,6 +561,8 @@ def build_config_yaml(d):
     sched = str(d.get("update_time") or "").strip()
     if sched:
         out["updates"] = {"schedule": Quoted(sched)}
+        if d.get("update_critical") is False:
+            out["updates"]["critical"] = False
     return dump_yaml(out, "# Written by the Sallyport GUI. Comments added by hand are not kept when it saves.\n")
 
 
@@ -577,7 +579,7 @@ def flatten_config(data):
             "domains": access.get("domains") or [],
             "groups_claim": access.get("groups_claim", ""),
             "admin_emails": admin.get("emails") or [], "admin_groups": admin.get("groups") or [],
-            "update_time": str(updates.get("schedule") or ""),
+            "update_time": str(updates.get("schedule") or ""), "update_critical": updates.get("critical", True) is not False,
             "lifetime": session.get("lifetime", "8h"), "idle_timeout": session.get("idle_timeout", "30m")}
 
 
@@ -901,6 +903,7 @@ details summary{cursor:pointer;margin-bottom:8px}
 <label for="c_idle">Idle timeout</label><input type="text" id="c_idle" placeholder="30m">
 <label for="c_upd">Automatic update time</label><input type="text" id="c_upd" placeholder="03:00 (24-hour, this computer's time; empty = off)">
 </div>
+<label class="sub"><input type="checkbox" id="c_crit" checked> Also check hourly for an update the maintainers flag as <b>critical</b> (for example a pre-login weakness in Pomerium) and apply it <b>immediately</b>, ending any sessions in progress. Ordinary updates still wait for the time above.</label>
 <div class="sub" id="updInfo"></div>
 <div class="row"><button id="c_validate">Validate</button><button id="c_save" class="p">Save settings</button><span id="cmsg" class="msg"></span><button id="c_apply" class="p hide" data-a="apply_settings">Apply settings and start now</button></div>
 <div class="warn">The client secret is stored in plain text in sallyport.yaml. Saving changes nothing in the running system until you apply the settings (see Operate below).</div></section>
@@ -1090,6 +1093,7 @@ function getCfg(){
   d.acme_staging=$("#c_staging").checked;
   d.scopes=($("#c_scopes").value.split(/[\s,]+/)).filter(Boolean);
   d.emails=lines($("#c_emails").value); d.groups=lines($("#c_groups").value); d.domains=lines($("#c_domains").value);
+  d.update_critical=$("#c_crit").checked;
   d.admin_emails=lines($("#c_aemails").value); d.admin_groups=lines($("#c_agroups").value);
   return d;
 }
@@ -1099,6 +1103,7 @@ function setCfg(d){
   $("#c_staging").checked=d.acme_staging!==false;
   $("#c_scopes").value=(d.scopes||[]).join(" ");
   $("#c_emails").value=(d.emails||[]).join("\n"); $("#c_groups").value=(d.groups||[]).join("\n"); $("#c_domains").value=(d.domains||[]).join("\n");
+  $("#c_crit").checked=d.update_critical!==false;
   $("#c_aemails").value=(d.admin_emails||[]).join("\n"); $("#c_agroups").value=(d.admin_groups||[]).join("\n");
   cfgShow();
 }
@@ -1114,7 +1119,7 @@ async function cfgAction(kind){
     if(kind==="save"&&r.saved){await loadFile();refresh().catch(()=>{});$("#c_apply").classList.remove("hide")}
   }catch(e){m.className="msg bad";m.textContent=e.message}
 }
-$$("#prodFields input,#prodFields textarea,#prodFields select,#c_domain,#c_life,#c_idle,#c_upd,#c_aemails,#c_agroups,#c_mode").forEach(e=>e.addEventListener("input",()=>$("#c_apply").classList.add("hide")));
+$$("#prodFields input,#prodFields textarea,#prodFields select,#c_domain,#c_life,#c_idle,#c_upd,#c_crit,#c_aemails,#c_agroups,#c_mode").forEach(e=>e.addEventListener("input",()=>$("#c_apply").classList.add("hide")));
 ["c_emails","c_groups","c_domains","c_issuer"].forEach(i=>$("#"+i).addEventListener("input",cfgShow)); $("#c_mode").onchange=cfgShow; $("#c_domain").oninput=cfgShow; $("#c_provider").onchange=cfgShow;
 $("#actionCopy").onclick=async()=>{const t=$("#actionCode");try{await navigator.clipboard.writeText(t.value)}catch(e){t.select();document.execCommand("copy")}$("#actionCopy").textContent="Copied";setTimeout(()=>$("#actionCopy").textContent="Copy",1500)};
 $("#c_validate").onclick=()=>cfgAction("validate"); $("#c_save").onclick=()=>cfgAction("save");
