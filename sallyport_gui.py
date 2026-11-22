@@ -804,6 +804,7 @@ textarea.small{height:70px;font:12.5px/1.4 Consolas,monospace}
 .acc{border:1px solid var(--bd);border-radius:6px;padding:8px 10px;margin:8px 0}
 .acc.open{border-color:#c62828;background:#c6282814}
 .acc .hint{color:#b26a00;font-size:.9em;margin:2px 0 4px}
+
 .acc .grid{margin:4px 0}
 h3{margin:14px 0 4px;font-size:1em}
 .hide{display:none!important}
@@ -883,6 +884,7 @@ details summary{cursor:pointer;margin-bottom:8px}
 <section><h2>Targets</h2>
 <div class="sub" id="tstatus"></div>
 <div id="openwarn" class="banner bad hide"></div>
+<div id="sharedinfo" class="banner upd hide"></div>
 <div class="sub">A <b>system</b> is a machine people can connect to. Each system has <b>access entries</b>: who may use it, and whether they get saved credentials or are asked for their own when they connect. Adding someone to your identity provider (and to Allowed emails in Settings) lets them log in, but they only see systems that have an access entry for them, or an entry for everyone.</div>
 <div class="targets">
 <div><div id="tlist" class="tlist"></div>
@@ -1158,7 +1160,9 @@ function toFile(){
   }
   return out;
 }
-const isOpen=s=>s.access.some(a=>a.who==="all");
+const hasSaved=a=>a.cred==="saved"&&!!(a.username||a.password||a.private_key||a.passphrase);
+const isOpen=s=>s.access.some(a=>a.who==="all"&&hasSaved(a));      // everyone, with stored credentials: warn
+const isShared=s=>s.access.some(a=>a.who==="all"&&!hasSaved(a));   // everyone, users bring their own credentials: info
 function userHint(em){
   em=em.trim().toLowerCase(); if(!em||cfgUsers.groups.length)return "";
   return cfgUsers.emails.includes(em)?"":"⚠ Not in Allowed emails (Settings tab), so this person cannot log in yet.";
@@ -1179,16 +1183,22 @@ function tWrite(){
 function tList(){
   const box=$("#tlist"); box.textContent="";
   systems.forEach((t,i)=>{const d=document.createElement("div"); d.className=i===sel?"on":"";
-    d.textContent=(isOpen(t)?"⚠ ":"")+(t.name||"(unnamed)"); const s=document.createElement("small");
+    d.textContent=(isOpen(t)?"⚠ ":isShared(t)?"ⓘ ":"")+(t.name||"(unnamed)"); const s=document.createElement("small");
     s.textContent=t.protocol+" "+(t.host||"")+" · "+t.access.length+" access"; d.appendChild(s);
     d.onclick=()=>{sel=i;tList();tFill()}; box.appendChild(d);});
   const open=systems.filter(isOpen).map(t=>t.name||"(unnamed)"), w=$("#openwarn");
   w.classList.toggle("hide",!open.length);
-  w.textContent=open.length?"⚠ Open to everyone who can log in: "+open.join(", ")+". Anyone you add to your identity provider later gets access to these automatically. Give each person their own access entry instead if that is not what you want.":"";
+  w.textContent=open.length?"⚠ Saved credentials open to everyone who can log in: "+open.join(", ")+". Anyone you add to your identity provider later gets use of these credentials automatically. Give each person their own access entry instead if that is not what you want.":"";
+  const sh=systems.filter(x=>isShared(x)&&!isOpen(x)).map(x=>x.name||"(unnamed)"), n=$("#sharedinfo");
+  n.classList.toggle("hide",!sh.length);
+  n.textContent=sh.length?"ⓘ Visible to everyone who can log in, but each person must supply their own credentials: "+sh.join(", ")+". Anyone you add later will see these systems in their list.":"";
 }
 function el(tag,cls,text){const e=document.createElement(tag);if(cls)e.className=cls;if(text!==undefined)e.textContent=text;return e}
 function addRow(grid,label,node){const l=el("label","",label);grid.appendChild(l);grid.appendChild(node);return node}
-function inp(a,k,type,ph){const i=el("input");i.type=type||"text";i.autocomplete="off";i.value=a[k];if(ph)i.placeholder=ph;i.oninput=()=>{a[k]=i.value};return i}
+function inp(a,k,type,ph){const i=el("input");i.type=type||"text";i.autocomplete="off";i.value=a[k];if(ph)i.placeholder=ph;
+  i.oninput=()=>{const was=hasSaved(a);a[k]=i.value;if(was!==hasSaved(a)&&a.who==="all"){tList();renderAccKeepFocus(i)}};return i}
+function renderAccKeepFocus(i){const idx=[...document.querySelectorAll("#acc input,#acc textarea")].indexOf(i),pos=i.selectionStart;renderAcc();
+  const n=[...document.querySelectorAll("#acc input,#acc textarea")][idx];if(n){n.focus();try{n.setSelectionRange(pos,pos)}catch(e){}}}
 function sel_(a,k,opts){const s=el("select");for(const [v,t] of opts){const o=el("option","",t);o.value=v;s.appendChild(o)}s.value=a[k];
   s.onchange=()=>{a[k]=s.value;tList();renderAcc()};return s}
 function renderAcc(){
@@ -1197,7 +1207,7 @@ function renderAcc(){
   const dl=$("#knownUsers"); dl.textContent=""; known.forEach(u=>{const o=el("option");o.value=u;dl.appendChild(o)});
   if(!s.access.length)box.appendChild(el("div","sub","No access entries: nobody can see this system yet. Add one."));
   s.access.forEach((a,i)=>{
-    const card=el("div","acc"+(a.who==="all"?" open":"")), g=el("div","grid");
+    const card=el("div","acc"+(a.who==="all"&&hasSaved(a)?" open":"")), g=el("div","grid");
     addRow(g,"Who",sel_(a,"who",[["user","One person"],["all","Everyone who can log in"]]));
     if(a.who==="user"){
       const em=inp(a,"email","text","person@example.com"); em.setAttribute("list","knownUsers");
@@ -1205,7 +1215,8 @@ function renderAcc(){
       addRow(g,"Email",em); card.appendChild(g); card.appendChild(hint);
     }else{
       card.appendChild(g);
-      card.appendChild(el("div","hint","⚠ Everyone who can log in gets this system, including anyone you add later."));
+      card.appendChild(el("div","hint",hasSaved(a)?"⚠ Everyone who can log in can use these saved credentials, including anyone you add later."
+        :"ⓘ Everyone who can log in sees this system, including anyone you add later. They must enter their own credentials."));
     }
     const g2=el("div","grid");
     addRow(g2,"Credentials",sel_(a,"cred",[["ask","Ask them when they connect"],["saved","Use saved credentials"]]));

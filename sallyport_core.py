@@ -636,10 +636,11 @@ def load_targets(data=None):
 
 def cmd_load_targets(args):
     targets = load_targets()
-    everyone = [t["name"] for t in targets if "users" not in t]
+    saved = ("username", "password", "private_key", "passphrase")
+    everyone = [t["name"] for t in targets if "users" not in t and any(k in t for k in saved)]
     if everyone:
-        print(f"note: {len(everyone)} target(s) are open to EVERY user who can log in, including anyone you add later: "
-              + ", ".join(everyone))
+        print(f"note: {len(everyone)} target(s) with saved credentials are open to EVERY user who can log in, "
+              "including anyone you add later: " + ", ".join(everyone))
     if args.dry_run:
         print(build_sql(targets, redact=True))
         return
