@@ -537,8 +537,6 @@ BRANDING_CSS = """\
 #sallyport-bar{top:0;left:50%;transform:translateX(-50%);display:flex;align-items:center;gap:8px;
   padding:5px 16px;border-bottom-left-radius:8px;border-bottom-right-radius:8px}
 #sallyport-bar svg{width:16px;height:16px;flex:none}
-#sallyport-signout{color:#fff;text-decoration:none;border-left:1px solid #ffffff66;padding-left:8px}
-#sallyport-signout:hover,#sallyport-signout:focus{text-decoration:underline}
 #sallyport-admin{bottom:0;left:0;padding:6px 14px;border-top-right-radius:8px;text-decoration:none}
 #sallyport-admin:hover,#sallyport-admin:focus{text-decoration:underline}
 .sallyport-hidden{display:none !important}
@@ -557,7 +555,7 @@ BRANDING_JS = r"""
     var n = ev.target, label = "";
     for (var i = 0; n && n.nodeType === 1 && i < 4; i++, n = n.parentNode) {
       label = (n.textContent || "").trim();
-      if (/^(log ?out|sign ?out)$/i.test(label) && n.id !== "sallyport-signout") {
+      if (/^(log ?out|sign ?out)$/i.test(label) ) {
         setTimeout(function () { location.href = SIGNOUT; }, 300);  // let Guacamole's own logout run first
         return;
       }
@@ -569,12 +567,6 @@ BRANDING_JS = r"""
     bar.id = "sallyport-bar";
     bar.innerHTML = '<svg viewBox="0 0 16 16" aria-hidden="true"><path fill="none" stroke="#fff" stroke-width="1.6" ' +
       'd="M2 15V7a6 6 0 0 1 12 0v8M5.5 15V8M8 15V3M10.5 15V8M2 11.5h12"/></svg><span>Sallyport</span>';
-    var out = document.createElement("a");
-    out.id = "sallyport-signout";
-    out.href = SIGNOUT;
-    out.textContent = "Sign out";
-    out.title = "End your Sallyport login completely";
-    bar.appendChild(out);
     document.body.appendChild(bar);
     if (ADMIN) {
       var a = document.createElement("a");
