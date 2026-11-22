@@ -528,7 +528,12 @@ def as_list(value):
 
 def build_config_yaml(d):
     mode = d.get("mode") or "production"
-    out = {"mode": mode, "domain": str(d.get("domain") or "").strip()}
+    out = {"mode": mode}
+    sub, token = str(d.get("ddns_subdomain") or "").strip(), str(d.get("ddns_token") or "").strip()
+    if mode != "dev" and (sub or token):
+        out["dynamic_dns"] = {"provider": "duckdns", "subdomain": sub, "token": token}  # the domain is derived from it
+    else:
+        out["domain"] = str(d.get("domain") or "").strip()
     session = {"lifetime": str(d.get("lifetime") or "8h").strip(), "idle_timeout": str(d.get("idle_timeout") or "30m").strip()}
     if mode != "dev":
         out["acme_email"] = str(d.get("acme_email") or "").strip()
@@ -561,8 +566,9 @@ def build_config_yaml(d):
 
 def flatten_config(data):
     idp, access, session = data.get("idp") or {}, data.get("access") or {}, data.get("session") or {}
-    admin, updates = data.get("admin") or {}, data.get("updates") or {}
-    return {"mode": data.get("mode", "production"), "domain": data.get("domain", ""),
+    admin, updates, ddns = data.get("admin") or {}, data.get("updates") or {}, data.get("dynamic_dns") or {}
+    return {"mode": data.get("mode", "production"), "domain": data.get("domain", "") if not ddns else "",
+            "ddns_subdomain": ddns.get("subdomain", ""), "ddns_token": ddns.get("token", ""),
             "acme_email": data.get("acme_email", ""), "acme_staging": data.get("acme_staging", True),
             "provider": idp.get("provider", "oidc"), "issuer": idp.get("issuer", ""), "idp_domain": idp.get("domain", ""),
             "client_id": idp.get("client_id", ""),
@@ -864,6 +870,8 @@ details summary{cursor:pointer;margin-bottom:8px}
 <label for="c_domain">Domain</label><input type="text" id="c_domain" placeholder="access.client.example (dev: access.localhost)">
 </div>
 <div id="prodFields"><div class="grid">
+<label for="c_ddns_sub">DuckDNS name</label><input type="text" id="c_ddns_sub" placeholder="optional: myfirm (for myfirm.duckdns.org)">
+<label for="c_ddns_token">DuckDNS token</label><span class="row"><input type="password" id="c_ddns_token" autocomplete="off"></span>
 <label for="c_acme_email">ACME email</label><input type="text" id="c_acme_email" placeholder="ops@msp.example">
 <label for="c_staging">Let's Encrypt staging</label><span><input type="checkbox" id="c_staging"> <label for="c_staging" class="sub">untrusted test certificates; untick for real ones</label></span>
 <label for="c_provider">Identity provider</label><select id="c_provider"><option value="oidc">Generic OpenID Connect</option><option value="auth0">Auth0</option><option value="google">Google</option></select>
@@ -882,6 +890,7 @@ details summary{cursor:pointer;margin-bottom:8px}
 <label for="c_aemails">Admin site: emails</label><textarea id="c_aemails" class="small" placeholder="one per line: who may open the admin site"></textarea>
 <label class="p_groups" for="c_agroups">Admin site: groups</label><textarea id="c_agroups" class="small p_groups" placeholder="one group ID per line (optional)"></textarea>
 </div>
+<div class="sub">No domain of your own? Register a free name at <b>duckdns.org</b>, enter the name and your token above and leave Domain empty. Sallyport then uses <code>name.duckdns.org</code>, keeps it pointed at this server even when your public address changes, and the <code>authenticate.</code> and <code>admin.</code> names work with no further DNS. You still need ports 80 and 443 forwarded to this machine, and a public (non carrier-grade NAT) address. The token is stored in plain text in <code>sallyport.yaml</code>.</div>
 <div class="sub">The admin site (<code>admin.&lt;your domain&gt;</code>) is where systems, people, groups and logins are managed. It is reached through the same login as everything else but has its own allow-list: only the accounts listed here. Leave both empty to turn it off. It needs a DNS record for <code>admin.&lt;your domain&gt;</code> pointing at this server, like the main one.</div>
 <details id="idpHelp" open><summary><b>How to set this up with your identity provider</b></summary><div id="helpBody" class="sub"></div>
 <div id="actionBox" class="hide"><div class="sub">Auth0 login Action for groups (Actions &rarr; Library &rarr; Create Action &rarr; Login / Post Login; deploy it, then add it to the Login flow):</div>
@@ -1037,7 +1046,7 @@ $("#validate").onclick=()=>fileAction("validate"); $("#save").onclick=()=>fileAc
 $("#quit").onclick=async()=>{try{await api("/api/quit",{})}catch(e){} document.body.textContent="Stopped. You can close this tab."};
 
 /* ---- settings form ---- */
-const CF={mode:"c_mode",domain:"c_domain",acme_email:"c_acme_email",provider:"c_provider",issuer:"c_issuer",idp_domain:"c_idp_domain",client_id:"c_client_id",client_secret:"c_secret",groups_claim:"c_claim",lifetime:"c_life",idle_timeout:"c_idle",update_time:"c_upd"};
+const CF={mode:"c_mode",domain:"c_domain",acme_email:"c_acme_email",provider:"c_provider",issuer:"c_issuer",idp_domain:"c_idp_domain",client_id:"c_client_id",client_secret:"c_secret",groups_claim:"c_claim",lifetime:"c_life",idle_timeout:"c_idle",update_time:"c_upd",ddns_subdomain:"c_ddns_sub",ddns_token:"c_ddns_token"};
 const lines=v=>(v||"").split(/\r?\n/).map(x=>x.trim()).filter(Boolean);
 const ACTION_CODE="exports.onExecutePostLogin = async (event, api) => {\n  if (event.authorization) {\n    api.idToken.setCustomClaim('pomerium.io/groups', event.authorization.roles);\n  }\n};\n";
 function helpList(items){const ol=document.createElement("ol");items.forEach(t=>{const l=document.createElement("li");l.textContent=t;ol.appendChild(l)});return ol}

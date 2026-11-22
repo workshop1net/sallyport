@@ -154,6 +154,19 @@ Treat these as the to-do list, not as footnotes.
 
 The database schema and setup scripts run only when the `postgres-data` volume is first created. To change them on an existing install, apply the SQL by hand. To update everything by hand: `./sallyport update` (see below). Plain `docker compose pull && docker compose up -d --build` also works, followed by `./sallyport migrate-db`. Back up the `postgres-data` volume first.
 
+### No domain of your own: DuckDNS
+
+If you have no DNS provider to hand, or a home or office connection whose public address changes, register a free name at duckdns.org and replace `domain:` in `sallyport.yaml` with:
+
+```yaml
+dynamic_dns:
+  provider: duckdns
+  subdomain: myfirm      # myfirm.duckdns.org
+  token: your-duckdns-token
+```
+
+Sallyport then uses `myfirm.duckdns.org` as the domain and runs a small `duckdns` container that tells DuckDNS your current public address every five minutes. DuckDNS answers for every name under yours, so `authenticate.myfirm.duckdns.org` and `admin.myfirm.duckdns.org` need no records of their own. Everything else is unchanged: forward ports 80 and 443 to the machine (Let's Encrypt needs both), and Let's Encrypt certificates work because `duckdns.org` is on the public suffix list, so its rate limits apply per name. The token is stored in plain text in `sallyport.yaml` and `.env`. It will not work behind carrier-grade NAT (an ISP that shares one public address between customers), and the name stops working if you leave your DuckDNS account unused long enough for it to be reclaimed.
+
 ### Scheduled unattended updates
 
 Certificate renewal does not depend on this: Pomerium's autocert renews Let's Encrypt certificates itself, keeping them in the `pomerium-data` volume, which updates never remove. It needs port 443 reachable from the internet and the container running, so a nightly update that leaves the stack healthy is also what keeps renewal working. Moving from `acme_staging: true` to real certificates is a one-off manual change.

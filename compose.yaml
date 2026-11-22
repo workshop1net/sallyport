@@ -90,6 +90,30 @@ services:
     security_opt:
       - no-new-privileges:true
 
+  # Keeps <subdomain>.duckdns.org pointing at this server's current public address. Only runs when
+  # dynamic_dns is set in sallyport.yaml (init sets COMPOSE_PROFILES=duckdns in .env). DuckDNS answers
+  # for every name under your subdomain, so authenticate. and admin. need no records of their own.
+  duckdns:
+    profiles: [duckdns]
+    image: curlimages/curl:latest
+    restart: unless-stopped
+    environment:
+      SUBDOMAIN: ${DUCKDNS_SUBDOMAIN:-}
+      TOKEN: ${DUCKDNS_TOKEN:-}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        while true; do
+          r=$$(curl -sS --max-time 30 "https://www.duckdns.org/update?domains=$$SUBDOMAIN&token=$$TOKEN&ip=" 2>&1 | head -c 200)
+          echo "$$(date -u +%Y-%m-%dT%H:%M:%SZ) duckdns update: $$r"
+          sleep 300
+        done
+    read_only: true
+    cap_drop: [ALL]
+    networks: [edge]
+    security_opt:
+      - no-new-privileges:true
+
   guacd:
     image: guacamole/guacd:latest
     restart: unless-stopped

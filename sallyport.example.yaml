@@ -49,6 +49,13 @@ session:
   lifetime: 8h # how long a login lasts before the user must sign in again
   idle_timeout: 30m
 
+# No domain of your own? Use a free DuckDNS name instead of `domain:` (see README). Sallyport then
+# runs a container that keeps it pointed at this server.
+# dynamic_dns:
+#   provider: duckdns
+#   subdomain: myfirm
+#   token: your-duckdns-token
+
 # Who may open the admin site (https://admin.<domain>), where systems, people, groups and
 # logins are managed. It has its own allow-list; leave both empty to turn it off.
 # Needs a DNS record for admin.<domain> like the main one.
