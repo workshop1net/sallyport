@@ -562,20 +562,33 @@ BRANDING_JS = r"""
 
 def make_branding(c):
     """generated/sallyport-branding.jar: a Guacamole extension (a zip with guac-manifest.json) adding the Sallyport bar."""
-    import zipfile
     manifest = {"guacamoleVersion": "*", "name": "Sallyport branding", "namespace": "sallyport",
                 "css": ["sallyport.css"], "js": ["sallyport.js"]}
     admin = bool(c["mode"] == "dev" or c["admin_emails"] or c["admin_groups"])
     files = {"guac-manifest.json": json.dumps(manifest, indent=2), "sallyport.css": BRANDING_CSS,
              "sallyport.js": BRANDING_JS.lstrip() % {"admin": "true" if admin else "false"}}
+    import io
+    import zipfile
     GEN.mkdir(exist_ok=True)
     path = GEN / "sallyport-branding.jar"
-    tmp = path.with_suffix(".tmp")
-    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as z:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
         for name, text in files.items():  # fixed timestamps, so an unchanged extension is byte-identical
             z.writestr(zipfile.ZipInfo(name, (2020, 1, 1, 0, 0, 0)), text.encode("utf-8"))
-    os.chmod(tmp, 0o644)
-    os.replace(tmp, path)
+    data = buf.getvalue()
+    try:
+        if path.exists() and path.read_bytes() == data:
+            return  # unchanged: leave the file alone (Docker may have it mounted)
+    except OSError:
+        pass
+    try:
+        # Write in place: the running Guacamole container has this file bind-mounted, and Windows refuses to
+        # replace or delete a file that is in use, but allows it to be overwritten.
+        with open(path, "wb") as f:
+            f.write(data)
+        os.chmod(path, 0o644)
+    except OSError as e:
+        die(f"could not write {path}: {e}. If the stack is running, stop it (docker compose down) and run init again.")
 
 
 def cmd_init(args):
