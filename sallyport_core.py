@@ -10,6 +10,7 @@ Requires Python 3 and PyYAML; dev mode also needs the cryptography package.
 """
 import argparse
 import base64
+import json
 import os
 import re
 import secrets
@@ -58,6 +59,9 @@ AUTH0_DOMAIN_RE = re.compile(r"^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?\.[a-z]{2,63
 PROVIDERS = ("oidc", "auth0", "google")
 AUTH0_GROUPS_CLAIM = "pomerium.io/groups"  # the claim name Pomerium's Auth0 guide uses
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._()@+,-]{0,199}$")
+GROUP_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}$")
+SYSTEM_KEYS = {"name", "protocol", "host", "port", "clipboard", "max_sessions", "security", "ignore_cert", "host_key"}
+CRED_KEYS = ("username", "password", "domain", "private_key", "passphrase")
 HOST_RE = re.compile(r"^[A-Za-z0-9._:-]{1,253}$")
 
 
@@ -110,6 +114,15 @@ def parse_session(cfg):
     return lifetime, idle
 
 
+def shared_issuer(issuer):
+    """True for issuers that authenticate the general public, not one organisation's users."""
+    i = (issuer or "").lower().rstrip("/")
+    if i.startswith("https://accounts.google.com"):
+        return True
+    m = re.match(r"^https://login\.microsoftonline\.com/([^/]+)", i)
+    return bool(m and m.group(1) in ("common", "organizations", "consumers"))
+
+
 def validate_dev(cfg):
     check_keys("sallyport.yaml (dev mode)", cfg, {"mode", "domain", "session"}, required=("domain",))
     domain = str(cfg["domain"]).lower()
@@ -118,6 +131,7 @@ def validate_dev(cfg):
             "it uses a throwaway login and an untrusted certificate and must never face a network")
     lifetime, idle = parse_session(cfg)
     return {"mode": "dev", "domain": domain, "emails": [DEV_EMAIL], "groups": [], "groups_claim": "groups",
+            "domains": [], "open_idp": False,
             "lifetime": lifetime, "idle": idle, "client_secret": None}
 
 
@@ -184,7 +198,7 @@ def validate_config(cfg):
     access = cfg["access"]
     if not isinstance(access, dict):
         die("access must be a mapping")
-    check_keys("access", access, {"emails", "groups", "groups_claim"})
+    check_keys("access", access, {"emails", "groups", "groups_claim", "domains"})
     emails = access.get("emails") or []
     groups = access.get("groups") or []
     if not isinstance(emails, list) or not isinstance(groups, list):
@@ -194,8 +208,17 @@ def validate_config(cfg):
             die(f"access.emails: '{e}' is not an email address")
     for g in groups:
         nonempty_str("access.groups", "entry", g, 256)
-    if not emails and not groups:
-        die("access must list at least one email or group, or nobody could log in")
+    domains = access.get("domains") or []
+    if not isinstance(domains, list):
+        die("access.domains must be a list")
+    domains = [str(d).strip().lower() for d in domains]
+    for d in domains:
+        if not DOMAIN_RE.match(d):
+            die(f"access.domains: '{d}' is not a domain name such as example.com")
+    open_idp = not emails and not groups and not domains
+    if open_idp and (provider == "google" or shared_issuer(issuer)):
+        die("access lists nobody, which would admit anyone this identity provider authenticates, and this one "
+            "authenticates the general public (any Google or Microsoft account). List emails, groups or domains.")
     claim = access.get("groups_claim", AUTH0_GROUPS_CLAIM if provider == "auth0" else "groups")
     if not isinstance(claim, str) or not CLAIM_RE.match(claim):
         die("access.groups_claim is not a valid claim name")
@@ -208,7 +231,7 @@ def validate_config(cfg):
         "mode": "production", "domain": domain, "acme_email": email, "staging": staging,
         "provider": provider, "issuer": issuer, "client_id": idp["client_id"], "client_secret": idp["client_secret"],
         "scopes": scopes, "emails": [e.strip() for e in emails], "groups": groups,
-        "groups_claim": claim, "lifetime": lifetime, "idle": idle,
+        "groups_claim": claim, "domains": domains, "open_idp": open_idp, "lifetime": lifetime, "idle": idle,
     }
 
 
@@ -233,6 +256,9 @@ def render_pomerium(c):
     dev = c["mode"] == "dev"
     policy = [{"email": {"is": e}} for e in c["emails"]]
     policy += [{f"claim/{c['groups_claim']}": g} for g in c["groups"]]
+    policy += [{"domain": {"is": d}} for d in c["domains"]]
+    if not policy:  # nothing listed: the identity provider alone decides (validate_config rejects public providers)
+        policy = [{"authenticated_user": True}]
     if dev:
         tls = {
             "certificates": [{"cert": "/pomerium/certs/tls.crt", "key": "/pomerium/certs/tls.key"}],
@@ -356,11 +382,12 @@ def init_dev(c, env):
         write_text(
             TARGETS,
             "# Dev mode test targets: throwaway SSH and RDP containers from compose.dev.yaml.\n"
-            "targets:\n  - name: sshtest\n    protocol: ssh\n    host: sshtest\n    port: 2222\n"
-            "    username: test\n    password: test\n"
+            "systems:\n  - name: sshtest\n    protocol: ssh\n    host: sshtest\n    port: 2222\n"
             "  - name: rdptest\n    protocol: rdp\n    host: rdptest\n    port: 3389\n"
-            "    username: abc\n    password: abc\n    security: tls   # xrdp does not support NLA\n"
-            "    ignore_cert: true   # xrdp uses a self-signed certificate\n")
+            "    security: tls        # xrdp does not support NLA\n"
+            "    ignore_cert: true    # xrdp uses a self-signed certificate\n"
+            "logins:\n  - system: sshtest\n    everyone: true\n    username: test\n    password: test\n"
+            "  - system: rdptest\n    everyone: true\n    username: abc\n    password: abc\n")
         print("wrote targets.yaml with test SSH and RDP targets")
 
 
@@ -445,7 +472,7 @@ def cmd_init(args):
 
 RDP_SECURITY = {"nla", "tls", "rdp", "any"}
 CLIPBOARD = {"both", "none", "paste-only", "copy-only"}
-COMMON_KEYS = {"name", "protocol", "host", "port", "username", "password", "clipboard", "max_sessions", "users"}
+COMMON_KEYS = {"name", "protocol", "host", "port", "username", "password", "clipboard", "max_sessions", "users", "groups"}
 PROTOCOL_KEYS = {
     "rdp": COMMON_KEYS | {"domain", "security", "ignore_cert"},
     "ssh": COMMON_KEYS | {"private_key", "passphrase", "host_key"},
@@ -531,9 +558,49 @@ def target_params(t):
     return params
 
 
-def build_sql(targets, redact=False):
+def sql_ensure_users(emails):
+    """Create accounts ahead of first login so permissions and group membership can be granted now.
+    The password hash is random and unknowable: these accounts only ever log in through Pomerium."""
+    if not emails:
+        return []
+    listed = ", ".join(q(u) for u in emails)
+    vals = ", ".join(f"({q(u)})" for u in emails)
+    return [
+        "INSERT INTO guacamole_entity (name, type)\n"
+        f"SELECT v.u, 'USER'::guacamole_entity_type FROM (VALUES {vals}) v(u)\n"
+        "WHERE NOT EXISTS (SELECT 1 FROM guacamole_entity x WHERE x.name = v.u AND x.type = 'USER');",
+        "INSERT INTO guacamole_user (entity_id, password_hash, password_salt, password_date)\n"
+        "SELECT e.entity_id, sha256(convert_to(random()::text || clock_timestamp()::text || e.name, 'UTF8')),\n"
+        "       sha256(convert_to(clock_timestamp()::text || random()::text, 'UTF8')), now()\n"
+        f"FROM guacamole_entity e WHERE e.type = 'USER' AND e.name IN ({listed})\n"
+        "AND NOT EXISTS (SELECT 1 FROM guacamole_user x WHERE x.entity_id = e.entity_id);"]
+
+
+def build_sql(targets, groups=None, redact=False):
     names = []
+    groups = groups or {}
     out = ["-- generated by ./sallyport load-targets"]
+    for g, members in groups.items():
+        out.append(f"-- group {g}")
+        out += sql_ensure_users(members)
+        out.append(
+            "INSERT INTO guacamole_entity (name, type)\n"
+            f"SELECT {q(g)}, 'USER_GROUP'::guacamole_entity_type\n"
+            f"WHERE NOT EXISTS (SELECT 1 FROM guacamole_entity WHERE name = {q(g)} AND type = 'USER_GROUP');")
+        out.append(
+            "INSERT INTO guacamole_user_group (entity_id, disabled)\n"
+            f"SELECT e.entity_id, FALSE FROM guacamole_entity e WHERE e.name = {q(g)} AND e.type = 'USER_GROUP'\n"
+            "AND NOT EXISTS (SELECT 1 FROM guacamole_user_group x WHERE x.entity_id = e.entity_id);")
+        out.append(
+            "DELETE FROM guacamole_user_group_member WHERE user_group_id IN (SELECT ug.user_group_id FROM guacamole_user_group ug\n"
+            f"JOIN guacamole_entity e ON e.entity_id = ug.entity_id WHERE e.name = {q(g)} AND e.type = 'USER_GROUP');")
+        if members:
+            out.append(
+                "INSERT INTO guacamole_user_group_member (user_group_id, member_entity_id)\n"
+                "SELECT ug.user_group_id, m.entity_id FROM guacamole_user_group ug\n"
+                f"JOIN guacamole_entity ge ON ge.entity_id = ug.entity_id AND ge.type = 'USER_GROUP' AND ge.name = {q(g)},\n"
+                f"guacamole_entity m WHERE m.type = 'USER' AND m.name IN ({', '.join(q(u) for u in members)})\n"
+                "ON CONFLICT DO NOTHING;")
     for t in targets:
         name = t["name"]
         names.append(name)
@@ -568,7 +635,16 @@ def build_sql(targets, redact=False):
             "DELETE FROM guacamole_connection_permission WHERE connection_id IN "
             f"(SELECT connection_id FROM guacamole_connection WHERE {where});")
         users = target_users(t)
-        if users is None:
+        tgroups = t.get("groups") or []
+        if tgroups:
+            listed = ", ".join(q(g) for g in tgroups)
+            out.append(
+                "INSERT INTO guacamole_connection_permission (entity_id, connection_id, permission)\n"
+                "SELECT e.entity_id, c.connection_id, 'READ'::guacamole_object_permission_type\n"
+                "FROM guacamole_entity e, guacamole_connection c\n"
+                f"WHERE e.type = 'USER_GROUP' AND e.name IN ({listed}) AND c.connection_name = {n} AND c.parent_id IS NULL\n"
+                "ON CONFLICT DO NOTHING;")
+        elif users is None:
             out.append(
                 "INSERT INTO guacamole_connection_permission (entity_id, connection_id, permission)\n"
                 "SELECT e.entity_id, c.connection_id, 'READ'::guacamole_object_permission_type\n"
@@ -577,19 +653,7 @@ def build_sql(targets, redact=False):
                 "ON CONFLICT DO NOTHING;")
         elif users:
             listed = ", ".join(q(u) for u in users)
-            vals = ", ".join(f"({q(u)})" for u in users)
-            # Create the account ahead of the person's first login so the permission can be granted now.
-            # The password hash is random and unknowable: these accounts only ever log in via Pomerium.
-            out.append(
-                "INSERT INTO guacamole_entity (name, type)\n"
-                f"SELECT v.u, 'USER'::guacamole_entity_type FROM (VALUES {vals}) v(u)\n"
-                "WHERE NOT EXISTS (SELECT 1 FROM guacamole_entity x WHERE x.name = v.u AND x.type = 'USER');")
-            out.append(
-                "INSERT INTO guacamole_user (entity_id, password_hash, password_salt, password_date)\n"
-                "SELECT e.entity_id, sha256(convert_to(random()::text || clock_timestamp()::text || e.name, 'UTF8')),\n"
-                "       sha256(convert_to(clock_timestamp()::text || random()::text, 'UTF8')), now()\n"
-                f"FROM guacamole_entity e WHERE e.type = 'USER' AND e.name IN ({listed})\n"
-                "AND NOT EXISTS (SELECT 1 FROM guacamole_user x WHERE x.entity_id = e.entity_id);")
+            out += sql_ensure_users(users)
             out.append(
                 "INSERT INTO guacamole_connection_permission (entity_id, connection_id, permission)\n"
                 "SELECT e.entity_id, c.connection_id, 'READ'::guacamole_object_permission_type\n"
@@ -602,16 +666,92 @@ def build_sql(targets, redact=False):
         out.append(f"DELETE FROM guacamole_connection WHERE parent_id IS NULL AND connection_name NOT IN ({listed});")
     else:
         out.append("DELETE FROM guacamole_connection WHERE parent_id IS NULL;")
+    keep = ", ".join(q(g) for g in [DEFAULT_GROUP] + list(groups))
+    out.append(f"DELETE FROM guacamole_entity WHERE type = 'USER_GROUP' AND name NOT IN ({keep});")
     return "\n".join(out) + "\n"
 
 
-def load_targets(data=None):
+def email_list(section, value):
+    if not isinstance(value, list):
+        die(f"{section} must be a list of email addresses")
+    out = []
+    for u in value:
+        if not isinstance(u, str) or not EMAIL_RE.match(u.strip()) or len(u) > 128 or "'" in u:
+            die(f"{section}: '{u}' is not an email address")
+        u = u.strip().lower()
+        if u not in out:
+            out.append(u)
+    return out
+
+
+def compile_access(data):
+    """targets.yaml -> (connections, groups {name: [emails]}, users [emails]).
+
+    The file has systems, users, groups and logins; each login becomes one Guacamole connection.
+    The older flat `targets:` list is still accepted and is already one entry per connection."""
+    if "targets" in data:
+        check_keys("targets.yaml", data, {"targets"}, required=("targets",))
+        if not isinstance(data["targets"], list):
+            die("targets must be a list")
+        return data["targets"], {}, []
+    check_keys("targets.yaml", data, {"systems", "users", "groups", "logins"})
+    systems = {}
+    for sysd in data.get("systems") or []:
+        if not isinstance(sysd, dict):
+            die("each system must be a mapping")
+        check_keys("system", sysd, SYSTEM_KEYS, required=("name", "protocol", "host"))
+        name = sysd["name"]
+        if not isinstance(name, str) or not NAME_RE.match(name):
+            die(f"system name '{name}' must start with a letter or digit and use letters, digits, space and . _ - ( ) @ + ,")
+        if name in systems:
+            die(f"duplicate system name '{name}'")
+        systems[name] = sysd
+    users = email_list("users", data.get("users") or [])
+    groups = {}
+    for g in data.get("groups") or []:
+        if not isinstance(g, dict):
+            die("each group must be a mapping")
+        check_keys("group", g, {"name", "users"}, required=("name",))
+        gname = g["name"]
+        if not isinstance(gname, str) or not GROUP_NAME_RE.match(gname) or gname == DEFAULT_GROUP:
+            die(f"group name '{gname}' must start with a letter or digit, use letters, digits, space and . _ -, and not be '{DEFAULT_GROUP}'")
+        if gname in groups:
+            die(f"duplicate group name '{gname}'")
+        groups[gname] = email_list(f"group '{gname}' users", g.get("users") or [])
+    conns = []
+    for i, lg in enumerate(data.get("logins") or [], 1):
+        sec = f"logins[{i}]"
+        if not isinstance(lg, dict):
+            die(f"{sec} must be a mapping")
+        check_keys(sec, lg, {"system", "user", "group", "everyone"} | set(CRED_KEYS), required=("system",))
+        who = [k for k in ("user", "group", "everyone") if k in lg]
+        if len(who) != 1:
+            die(f"{sec}: set exactly one of user, group or everyone")
+        if lg["system"] not in systems:
+            die(f"{sec}: system '{lg['system']}' is not defined under systems")
+        conn = dict(systems[lg["system"]])
+        conn.update({k: lg[k] for k in CRED_KEYS if k in lg})
+        if who[0] == "everyone":
+            if lg["everyone"] is not True:
+                die(f"{sec}: everyone must be true")
+            conn["name"] = lg["system"]
+        elif who[0] == "user":
+            em = email_list(sec + " user", [lg["user"]])[0]
+            conn["users"] = [em]
+            conn["name"] = f"{lg['system']} ({em})"
+        else:
+            if lg["group"] not in groups:
+                die(f"{sec}: group '{lg['group']}' is not defined under groups")
+            conn["groups"] = [lg["group"]]
+            conn["name"] = f"{lg['system']} ({lg['group']})"
+        conns.append(conn)
+    return conns, groups, users
+
+
+def load_access(data=None):
     if data is None:
         data = load_yaml(TARGETS)
-    check_keys("targets.yaml", data, {"targets"}, required=("targets",))
-    targets = data["targets"]
-    if not isinstance(targets, list):
-        die("targets must be a list")
+    targets, groups, users = compile_access(data)
     seen = set()
     for t in targets:
         if not isinstance(t, dict):
@@ -622,7 +762,7 @@ def load_targets(data=None):
         if not isinstance(name, str) or not NAME_RE.match(name):
             die(f"target name '{name}' must start with a letter or digit and use letters, digits, space and . _ - ( ) @ + ,")
         if name in seen:
-            die(f"duplicate target name '{name}'")
+            die(f"duplicate target name '{name}' (a person can have only one login per system, and a system only one for everyone)")
         seen.add(name)
         proto = t["protocol"]
         if proto not in PROTOCOL_KEYS:
@@ -631,20 +771,59 @@ def load_targets(data=None):
         if extra:
             die(f"target '{name}': {sorted(extra)} do not apply to {proto}")
         target_users(t)
-    return targets
+        if t.get("groups") and any(g not in groups for g in t["groups"]):
+            die(f"target '{name}': unknown group")
+    return targets, groups, users
+
+
+def load_targets(data=None):
+    return load_access(data)[0]
+
+
+def legacy_to_v2(items):
+    """Convert the old flat `targets:` list into systems, users and logins (for the GUI)."""
+    systems, seen, logins, users = [], set(), [], []
+    for e in items:
+        if not isinstance(e, dict):
+            continue
+        name = str(e.get("name", ""))
+        us = e.get("users") if isinstance(e.get("users"), list) else None
+        if us:
+            m = re.match(r"^(.*) \(([^()]*)\)$", name)
+            if m and m.group(2).startswith(str(us[0])):
+                name = m.group(1)
+        sysd = {"name": name, **{k: e[k] for k in e if k in SYSTEM_KEYS and k != "name"}}
+        key = json.dumps(sysd, sort_keys=True)
+        if key not in seen:
+            seen.add(key)
+            systems.append(sysd)
+        if us == []:
+            continue
+        cred = {k: e[k] for k in CRED_KEYS if k in e}
+        if us is None:
+            logins.append({"system": name, "everyone": True, **cred})
+        else:
+            for u in us:
+                logins.append({"system": name, "user": u, **cred})
+                if u not in users:
+                    users.append(u)
+    return {"systems": systems, "users": users, "groups": [], "logins": logins}
 
 
 def cmd_load_targets(args):
-    targets = load_targets()
+    targets, groups, _users = load_access()
     saved = ("username", "password", "private_key", "passphrase")
-    everyone = [t["name"] for t in targets if "users" not in t and any(k in t for k in saved)]
+    everyone = [t["name"] for t in targets if "users" not in t and "groups" not in t and any(k in t for k in saved)]
     if everyone:
-        print(f"note: {len(everyone)} target(s) with saved credentials are open to EVERY user who can log in, "
+        print(f"note: {len(everyone)} login(s) with saved credentials are open to EVERY user who can log in, "
               "including anyone you add later: " + ", ".join(everyone))
+    shared = [t["name"] for t in targets if "groups" in t and any(k in t for k in saved)]
+    if shared:
+        print("note: saved credentials shared by every member of a group (not one account per person): " + ", ".join(shared))
     if args.dry_run:
-        print(build_sql(targets, redact=True))
+        print(build_sql(targets, groups, redact=True))
         return
-    sql = build_sql(targets)
+    sql = build_sql(targets, groups)
     psql = ["psql", "-v", "ON_ERROR_STOP=1", "--single-transaction", "-q", "-U", DB_OWNER, "-d", DB_NAME, "-f", "-"]
     if IN_CONTAINER:
         env = dict(os.environ, PGPASSWORD=read_env().get("POSTGRES_PASSWORD", ""))

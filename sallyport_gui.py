@@ -482,10 +482,10 @@ def validate_text(name, text):
         if name == "sallyport.yaml":
             c = core.validate_config(data)
             return True, f"valid ({c['mode']} mode, domain {c['domain']})"
-        targets = core.load_targets(data)
+        targets, groups, users = core.load_access(data)
         for t in targets:
             core.target_params(t)
-        return True, f"valid ({len(targets)} target(s))"
+        return True, f"valid ({len(targets)} login(s), {len(groups)} group(s))"
     except SystemExit as e:
         return False, re.sub(r"^error: ", "", str(e.code))
 
@@ -532,7 +532,8 @@ def build_config_yaml(d):
         if prov == "oidc":
             idp["scopes"] = as_list(d.get("scopes")) or ["openid", "profile", "email"]
         out["idp"] = idp
-        access = {"emails": as_list(d.get("emails")), "groups": [] if prov == "google" else as_list(d.get("groups"))}
+        access = {"emails": as_list(d.get("emails")), "groups": [] if prov == "google" else as_list(d.get("groups")),
+                  "domains": as_list(d.get("domains"))}
         if str(d.get("groups_claim") or "").strip():
             access["groups_claim"] = str(d["groups_claim"]).strip()
         out["access"] = access
@@ -548,6 +549,7 @@ def flatten_config(data):
             "client_id": idp.get("client_id", ""),
             "client_secret": idp.get("client_secret", ""), "scopes": idp.get("scopes") or ["openid", "profile", "email"],
             "emails": access.get("emails") or [], "groups": access.get("groups") or [],
+            "domains": access.get("domains") or [],
             "groups_claim": access.get("groups_claim", ""),
             "lifetime": session.get("lifetime", "8h"), "idle_timeout": session.get("idle_timeout", "30m")}
 
@@ -566,29 +568,41 @@ def read_structured(state, name):
     ok, msg = validate_text(name, text)
     if name == "sallyport.yaml":
         return {"exists": True, "data": flatten_config(data), "status": msg}
-    return {"exists": True, "data": data.get("targets") if isinstance(data.get("targets"), list) else [],
-            "status": msg}
+    if isinstance(data.get("targets"), list):
+        return {"exists": True, "data": core.legacy_to_v2(data["targets"]), "converted": True, "status": msg}
+    return {"exists": True, "converted": False, "status": msg,
+            "data": {k: data.get(k) if isinstance(data.get(k), list) else [] for k in ("systems", "users", "groups", "logins")}}
 
 
 INT_FIELDS = ("port", "max_sessions")
 
 
-def build_targets_yaml(items):
-    cleaned = []
-    for t in items if isinstance(items, list) else []:
+def _clean_rows(rows, keep_empty=()):
+    out = []
+    for t in rows if isinstance(rows, list) else []:
         if not isinstance(t, dict):
             continue
         row = {}
         for k, v in t.items():
-            if v is None or v == "":
+            if v is None or (v == "" and k not in keep_empty):
                 continue
             if k in INT_FIELDS and isinstance(v, str) and v.strip().isdigit():
                 v = int(v.strip())
             row[str(k)] = v
-        cleaned.append(row)
+        out.append(row)
+    return out
+
+
+def build_targets_yaml(payload):
+    payload = payload if isinstance(payload, dict) else {}
+    out = {"systems": _clean_rows(payload.get("systems")),
+           "users": [str(u).strip() for u in payload.get("users") or [] if str(u).strip()],
+           "groups": [{"name": g.get("name", ""), "users": [str(u).strip() for u in g.get("users") or [] if str(u).strip()]}
+                      for g in payload.get("groups") or [] if isinstance(g, dict)],
+           "logins": _clean_rows(payload.get("logins"))}
     header = ("# Written by the Sallyport GUI. Contains credentials in plain text.\n"
               "# Comments added by hand are not kept when the GUI saves.\n")
-    return dump_yaml({"targets": cleaned}, header)
+    return dump_yaml(out, header)
 
 
 # ----------------------------------------------------------------------- server
@@ -803,7 +817,11 @@ textarea.small{height:70px;font:12.5px/1.4 Consolas,monospace}
 .tlist small{opacity:.7;display:block}
 .acc{border:1px solid var(--bd);border-radius:6px;padding:8px 10px;margin:8px 0}
 .acc.open{border-color:#c62828;background:#c6282814}
-.acc .hint{color:#b26a00;font-size:.9em;margin:2px 0 4px}
+.acc .hint,.urow .hint{color:#b26a00;font-size:.9em;margin:2px 0 4px}
+.acc .hint.info{color:inherit;opacity:.8}
+.urow{display:flex;gap:10px;align-items:center;flex-wrap:wrap;padding:4px 0;border-bottom:1px solid var(--bd)}
+.subtabs{display:flex;gap:4px;margin:8px 0 10px}.subtabs button{border:1px solid var(--bd);background:none;color:inherit;border-radius:14px;padding:4px 14px}
+.subtabs button.on{background:#4a90d933;font-weight:700}
 
 .acc .grid{margin:4px 0}
 h3{margin:14px 0 4px;font-size:1em}
@@ -855,9 +873,11 @@ details summary{cursor:pointer;margin-bottom:8px}
 <label for="c_secret">Client secret</label><span class="row"><input type="password" id="c_secret" autocomplete="off"><button type="button" id="c_show">Show</button></span>
 <label class="p_oidc" for="c_scopes">Scopes</label><input class="p_oidc" type="text" id="c_scopes" placeholder="openid profile email">
 <label for="c_emails">Allowed emails</label><textarea id="c_emails" class="small" placeholder="one per line"></textarea>
+<label for="c_domains">Allowed email domains</label><textarea id="c_domains" class="small" placeholder="one per line, for example example.com (optional)"></textarea>
 <label class="p_groups" for="c_groups">Allowed groups</label><textarea id="c_groups" class="small p_groups" placeholder="one group ID per line (optional)"></textarea>
 <label class="p_groups" for="c_claim">Groups claim</label><input class="p_groups" type="text" id="c_claim" placeholder="groups">
 </div>
+<div id="idpOpen" class="banner upd hide"></div>
 <details id="idpHelp" open><summary><b>How to set this up with your identity provider</b></summary><div id="helpBody" class="sub"></div>
 <div id="actionBox" class="hide"><div class="sub">Auth0 login Action for groups (Actions &rarr; Library &rarr; Create Action &rarr; Login / Post Login; deploy it, then add it to the Login flow):</div>
 <textarea id="actionCode" class="small" readonly spellcheck="false"></textarea><div class="row"><button type="button" id="actionCopy">Copy</button></div></div></details></div>
@@ -885,12 +905,12 @@ details summary{cursor:pointer;margin-bottom:8px}
 <div class="sub" id="tstatus"></div>
 <div id="openwarn" class="banner bad hide"></div>
 <div id="sharedinfo" class="banner upd hide"></div>
-<div class="sub">A <b>system</b> is a machine people can connect to. Each system has <b>access entries</b>: who may use it, and whether they get saved credentials or are asked for their own when they connect. Adding someone to your identity provider (and to Allowed emails in Settings) lets them log in, but they only see systems that have an access entry for them, or an entry for everyone.</div>
-<div class="targets">
+<div class="sub">Three lists. <b>Systems</b> are the machines people can connect to. <b>People &amp; groups</b> are the people you give access to, and named groups of them. <b>Logins</b> say who may use which system, and with which credentials (saved, or asked for when they connect). Someone who passes the identity provider but has no login of their own sees only the logins marked Everyone.</div>
+<div class="subtabs"><button data-s="systems" class="on">Systems</button><button data-s="people">People &amp; groups</button><button data-s="logins">Logins</button></div>
+<div id="st_systems" class="subpanel"><div class="targets">
 <div><div id="tlist" class="tlist"></div>
 <div class="row"><button id="t_add">Add system</button><button id="t_del">Delete system</button></div></div>
-<div id="tform">
-<div class="grid">
+<div id="tform"><div class="grid">
 <label for="t_name">Name</label><input type="text" id="t_name">
 <label for="t_protocol">Protocol</label><select id="t_protocol"><option>rdp</option><option>ssh</option></select>
 <label for="t_host">Host</label><input type="text" id="t_host" placeholder="10.0.0.10 or server.corp">
@@ -900,13 +920,21 @@ details summary{cursor:pointer;margin-bottom:8px}
 <label class="ssh" for="t_host_key">Host key</label><input class="ssh" type="text" id="t_host_key" placeholder="ssh-ed25519 AAAA... (strongly recommended)">
 <label for="t_clipboard">Clipboard</label><select id="t_clipboard"><option value="both">both ways</option><option value="none">none</option><option value="paste-only">paste only (you to target)</option><option value="copy-only">copy only (target to you)</option></select>
 <label for="t_max_sessions">Max sessions</label><input type="text" id="t_max_sessions" placeholder="1">
-</div>
-<h3>Who can use this system</h3>
-<div id="acc"></div>
-<div class="row"><button id="a_add">Add access</button><datalist id="knownUsers"></datalist></div>
-</div></div>
+</div><div class="sub" id="t_sysinfo"></div></div></div></div>
+<div id="st_people" class="subpanel hide">
+<h3>People</h3>
+<div class="sub">People you give logins to or put in groups. This is not the list of who may log in at all; that is under Settings.</div>
+<div id="ulist"></div>
+<div class="row"><input type="text" id="u_new" placeholder="person@example.com" list="knownUsers"><button id="u_add">Add person</button><datalist id="knownUsers"></datalist></div>
+<h3>Groups</h3>
+<div class="sub">A group is a named list of people. Use it to decide who sees a login, for example who sees the firewall.</div>
+<div id="glist"></div>
+<div class="row"><button id="g_add">Add group</button></div></div>
+<div id="st_logins" class="subpanel hide">
+<div class="row"><label for="l_filter">Show</label><select id="l_filter"></select><button id="l_add" class="p">Add login</button></div>
+<div id="llist"></div></div>
 <div class="row"><button id="t_validate">Validate</button><button id="t_save" class="p">Save targets</button><span id="tmsg" class="msg"></span><button id="t_apply" class="p hide" data-a="load_targets">Apply targets now</button></div>
-<div class="warn">Saved credentials are stored in plain text in targets.yaml and in the database. Use dedicated, least-privilege accounts, ideally one per person so the target's own logs show who did what. File transfer and printing are always off. Saving changes nothing in the running system until you apply the targets (below). Each person's access entry becomes a separate connection named like <code>System (person@example.com)</code>; <b>Max sessions</b> applies to each connection separately.</div></section>
+<div class="warn">Saved credentials are stored in plain text in targets.yaml and in the database. Use dedicated, least-privilege accounts, ideally one per person so the target's own logs show who did what. File transfer and printing are always off. Saving changes nothing in the running system until you apply the targets (below). Each login becomes a separate connection named like <code>System (person@example.com)</code>, so <b>Max sessions</b> applies to each connection separately.</div></section>
 
 <section><h2>Apply targets</h2>
 <div class="sub">Use this after you change targets above, and once after the first start. It copies <code>targets.yaml</code> into Guacamole, adding, changing and removing connections to match. No restart; sessions already open are not affected. The stack must be running.</div>
@@ -1053,6 +1081,11 @@ function cfgShow(){
   $$(".p_auth0").forEach(e=>e.classList.toggle("hide",prov!=="auth0"));
   $$(".p_groups").forEach(e=>e.classList.toggle("hide",prov==="google"));
   $("#c_claim").placeholder=prov==="auth0"?"pomerium.io/groups":"groups";
+  const none=!lines($("#c_emails").value).length&&!(prov!=="google"&&lines($("#c_groups").value).length)&&!lines($("#c_domains").value).length;
+  const pub=prov==="google"||/^https:\/\/accounts\.google\.com|^https:\/\/login\.microsoftonline\.com\/(common|organizations|consumers)/.test($("#c_issuer").value.trim());
+  const io=$("#idpOpen"); io.classList.toggle("hide",dev||!none); io.classList.toggle("bad",pub); io.classList.toggle("upd",!pub);
+  io.textContent=pub?"⚠ Nothing is listed, which would admit anyone this identity provider authenticates, and this one authenticates the general public. List emails or domains; Sallyport will refuse to save otherwise."
+    :"ⓘ Nothing is listed here, so anyone your identity provider authenticates can reach Sallyport. That is fine if the identity provider's Sallyport application only admits the people you intend (Auth0 does not do this by default: restrict the application with a login Action or Organizations). List emails, groups or domains here to add a second check.";
   const d=$("#c_domain").value.trim()||"<domain>", auth="https://authenticate."+d;
   const hb=$("#helpBody"); hb.textContent=""; $("#actionBox").classList.toggle("hide",prov!=="auth0");
   if(prov==="auth0"){
@@ -1080,7 +1113,7 @@ function getCfg(){
   const d={}; for(const k in CF)d[k]=$("#"+CF[k]).value;
   d.acme_staging=$("#c_staging").checked;
   d.scopes=($("#c_scopes").value.split(/[\s,]+/)).filter(Boolean);
-  d.emails=lines($("#c_emails").value); d.groups=lines($("#c_groups").value);
+  d.emails=lines($("#c_emails").value); d.groups=lines($("#c_groups").value); d.domains=lines($("#c_domains").value);
   return d;
 }
 function setCfg(d){
@@ -1088,7 +1121,7 @@ function setCfg(d){
   for(const k in CF)$("#"+CF[k]).value=d[k]??"";
   $("#c_staging").checked=d.acme_staging!==false;
   $("#c_scopes").value=(d.scopes||[]).join(" ");
-  $("#c_emails").value=(d.emails||[]).join("\n"); $("#c_groups").value=(d.groups||[]).join("\n");
+  $("#c_emails").value=(d.emails||[]).join("\n"); $("#c_groups").value=(d.groups||[]).join("\n"); $("#c_domains").value=(d.domains||[]).join("\n");
   cfgShow();
 }
 async function loadCfg(){
@@ -1104,30 +1137,25 @@ async function cfgAction(kind){
   }catch(e){m.className="msg bad";m.textContent=e.message}
 }
 $$("#prodFields input,#prodFields textarea,#prodFields select,#c_domain,#c_life,#c_idle,#c_mode").forEach(e=>e.addEventListener("input",()=>$("#c_apply").classList.add("hide")));
-$("#c_mode").onchange=cfgShow; $("#c_domain").oninput=cfgShow; $("#c_provider").onchange=cfgShow;
+["c_emails","c_groups","c_domains","c_issuer"].forEach(i=>$("#"+i).addEventListener("input",cfgShow)); $("#c_mode").onchange=cfgShow; $("#c_domain").oninput=cfgShow; $("#c_provider").onchange=cfgShow;
 $("#actionCopy").onclick=async()=>{const t=$("#actionCode");try{await navigator.clipboard.writeText(t.value)}catch(e){t.select();document.execCommand("copy")}$("#actionCopy").textContent="Copied";setTimeout(()=>$("#actionCopy").textContent="Copy",1500)};
 $("#c_validate").onclick=()=>cfgAction("validate"); $("#c_save").onclick=()=>cfgAction("save");
 $("#c_show").onclick=()=>{const i=$("#c_secret");i.type=i.type==="password"?"text":"password";$("#c_show").textContent=i.type==="password"?"Show":"Hide"};
 
-/* ---- targets editor: systems, each with access entries ---- */
+/* ---- targets: systems, people & groups, logins ---- */
 const SYS=["name","protocol","host","port","security","host_key","clipboard","max_sessions"];
-let systems=[], sel=-1, cfgUsers={emails:[],groups:[]};
-const blankSys=()=>({name:"",protocol:"rdp",host:"",port:"",security:"nla",ignore_cert:false,host_key:"",clipboard:"both",max_sessions:1,access:[]});
-const blankAcc=()=>({who:"user",email:"",cred:"ask",username:"",password:"",domain:"",private_key:"",passphrase:""});
-function fromFile(list){
-  const map=new Map(), out=[];
-  for(const e of list){
-    const users=Array.isArray(e.users)?e.users:null; let name=String(e.name||"");
-    if(users&&users.length){const m=/^(.*) \(([^()]*)\)$/.exec(name); if(m&&m[2].startsWith(users[0]))name=m[1];}
-    const sys={name,protocol:e.protocol||"rdp",host:e.host||"",port:e.port??"",security:e.security||"nla",ignore_cert:!!e.ignore_cert,host_key:e.host_key||"",clipboard:e.clipboard||"both",max_sessions:e.max_sessions??1};
-    const key=JSON.stringify(sys); let t=map.get(key);
-    if(!t){t=Object.assign(sys,{access:[]});map.set(key,t);out.push(t)}
-    const saved=!!(e.username||e.password||e.private_key||e.passphrase);
-    const base={cred:saved?"saved":"ask",username:e.username||"",password:e.password||"",domain:e.domain||"",private_key:e.private_key||"",passphrase:e.passphrase||""};
-    if(!users)t.access.push(Object.assign(blankAcc(),base,{who:"all"}));
-    else for(const u of users)t.access.push(Object.assign(blankAcc(),base,{who:"user",email:u}));
-  }
-  return out;
+let systems=[], users=[], groups=[], logins=[], sel=-1, cfgUsers={emails:[],groups:[],domains:[]};
+const blankSys=()=>({name:"",protocol:"rdp",host:"",port:"",security:"nla",ignore_cert:false,host_key:"",clipboard:"both",max_sessions:1});
+const blankLogin=()=>({who:"user",user:"",grp:null,sys:null,cred:"ask",username:"",password:"",domain:"",private_key:"",passphrase:""});
+const CREDK=["username","password","domain","private_key","passphrase"];
+const lc=x=>String(x||"").trim().toLowerCase();
+function fromFile(d){
+  systems=(d.systems||[]).map(e=>Object.assign(blankSys(),e,{port:e.port??"",host_key:e.host_key||"",ignore_cert:!!e.ignore_cert,max_sessions:e.max_sessions??1}));
+  users=(d.users||[]).map(lc); groups=(d.groups||[]).map(g=>({name:g.name||"",users:(g.users||[]).map(lc)}));
+  logins=(d.logins||[]).map(l=>{const o=blankLogin(); o.sys=systems.find(s=>s.name===l.system)||null;
+    if(l.everyone)o.who="all"; else if(l.group!==undefined){o.who="group";o.grp=groups.find(g=>g.name===l.group)||null} else o.user=lc(l.user);
+    for(const k of CREDK)o[k]=l[k]||"";
+    o.cred=(o.username||o.password||o.private_key||o.passphrase)?"saved":"ask"; return o;});
 }
 function sysProps(s){
   const o={protocol:s.protocol,host:s.host};
@@ -1137,107 +1165,172 @@ function sysProps(s){
   o.clipboard=s.clipboard; if(String(s.max_sessions).trim()!=="")o.max_sessions=s.max_sessions;
   return o;
 }
+function allUsers(){return [...new Set(users.concat(groups.flatMap(g=>g.users),logins.filter(l=>l.who==="user").map(l=>l.user)).map(lc).filter(Boolean))].sort()}
 function toFile(){
-  const out=[], names=new Set();
-  const mk=(name,s,extra)=>{
-    if(names.has(name.toLowerCase()))throw new Error("Two access entries would have the same name: "+name+". Each person can have only one entry per system, and a system only one 'everyone' entry.");
-    names.add(name.toLowerCase()); out.push(Object.assign({name},sysProps(s),extra));};
-  for(const s of systems){
-    if(!s.name.trim())throw new Error("A system has no name.");
-    if(!s.access.length)mk(s.name.trim(),s,{users:[]});
-    for(const a of s.access){
-      const cr={};
-      if(a.cred==="saved"){
-        for(const k of ["username","password"])if(a[k]!=="")cr[k]=a[k];
-        if(s.protocol==="rdp"&&a.domain)cr.domain=a.domain;
-        if(s.protocol==="ssh"){if(a.private_key)cr.private_key=a.private_key;if(a.passphrase)cr.passphrase=a.passphrase}
-      }
-      if(a.who==="all")mk(s.name.trim(),s,cr);
-      else{const em=a.email.trim().toLowerCase();
-        if(!em)throw new Error("An access entry on '"+s.name+"' has no person. Enter an email address or choose Everyone.");
-        mk(s.name.trim()+" ("+em+")",s,Object.assign({users:[em]},cr));}
+  const seen=new Set();
+  for(const s of systems){const n=s.name.trim(); if(!n)throw new Error("A system has no name."); if(seen.has(n))throw new Error("Two systems are called '"+n+"'."); seen.add(n)}
+  const gseen=new Set();
+  for(const g of groups){const n=g.name.trim(); if(!n)throw new Error("A group has no name."); if(gseen.has(n))throw new Error("Two groups are called '"+n+"'."); gseen.add(n)}
+  const out=[];
+  for(const l of logins){
+    if(!l.sys)throw new Error("A login has no system chosen.");
+    const o={system:l.sys.name.trim()};
+    if(l.who==="all")o.everyone=true;
+    else if(l.who==="group"){if(!l.grp)throw new Error("A login for '"+o.system+"' has no group chosen."); o.group=l.grp.name.trim()}
+    else{const em=lc(l.user); if(!em)throw new Error("A login for '"+o.system+"' has no person. Enter an email address, or choose a group or Everyone."); o.user=em}
+    if(l.cred==="saved"){
+      for(const k of ["username","password"])if(l[k]!=="")o[k]=l[k];
+      if(l.sys.protocol==="rdp"){if(l.domain)o.domain=l.domain}
+      else{if(l.private_key)o.private_key=l.private_key; if(l.passphrase)o.passphrase=l.passphrase}
     }
+    out.push(o);
   }
-  return out;
+  return {systems:systems.map(s=>Object.assign({name:s.name.trim()},sysProps(s))), users:allUsers(),
+    groups:groups.map(g=>({name:g.name.trim(),users:g.users.map(lc).filter(Boolean)})), logins:out};
 }
-const hasSaved=a=>a.cred==="saved"&&!!(a.username||a.password||a.private_key||a.passphrase);
-const isOpen=s=>s.access.some(a=>a.who==="all"&&hasSaved(a));      // everyone, with stored credentials: warn
-const isShared=s=>s.access.some(a=>a.who==="all"&&!hasSaved(a));   // everyone, users bring their own credentials: info
+const hasSaved=l=>l.cred==="saved"&&!!(l.username||l.password||l.private_key||l.passphrase);
+const openLogin=l=>l.who==="all"&&hasSaved(l);
+const isOpen=s=>logins.some(l=>l.sys===s&&openLogin(l));
+const isShared=s=>logins.some(l=>l.sys===s&&l.who==="all"&&!hasSaved(l));
 function userHint(em){
-  em=em.trim().toLowerCase(); if(!em||cfgUsers.groups.length)return "";
+  em=lc(em); if(!em||cfgUsers.groups.length||cfgUsers.domains.length||!cfgUsers.emails.length)return "";
   return cfgUsers.emails.includes(em)?"":"⚠ Not in Allowed emails (Settings tab), so this person cannot log in yet.";
 }
+function el(tag,cls,text){const e=document.createElement(tag);if(cls)e.className=cls;if(text!==undefined)e.textContent=text;return e}
+function addRow(grid,label,node){grid.appendChild(el("label","",label));grid.appendChild(node);return node}
+function objSelect(items,cur,label,onset){const s=el("select");let o=el("option","","— choose —");o.value="-1";s.appendChild(o);
+  items.forEach((x,i)=>{o=el("option","",label(x)||"(unnamed)");o.value=String(i);s.appendChild(o)});
+  s.value=String(items.indexOf(cur)); if(s.value==="")s.value="-1"; s.onchange=()=>{onset(items[+s.value]||null)}; return s}
+function valSelect(l,k,opts,after){const s=el("select");for(const [v,t] of opts){const o=el("option","",t);o.value=v;s.appendChild(o)}s.value=l[k];s.onchange=()=>{l[k]=s.value;after()};return s}
+function inp(l,k,type,ph,onflip){const i=el("input");i.type=type||"text";i.autocomplete="off";i.value=l[k];if(ph)i.placeholder=ph;
+  i.oninput=()=>{const was=hasSaved(l);l[k]=i.value;if(onflip&&was!==hasSaved(l))onflip()};return i}
+function refreshFlags(){
+  const open=[...new Set(systems.filter(isOpen).map(s=>s.name||"(unnamed)"))];
+  const shared=[...new Set(systems.filter(s=>isShared(s)&&!isOpen(s)).map(s=>s.name||"(unnamed)"))];
+  const gs=[...new Set(logins.filter(l=>l.who==="group"&&hasSaved(l)&&l.sys).map(l=>l.sys.name+" ("+(l.grp?l.grp.name:"?")+")"))];
+  const w=$("#openwarn"), lines=[];
+  if(open.length)lines.push("⚠ Saved credentials open to everyone who can log in: "+open.join(", ")+". Anyone you add to your identity provider later gets use of these credentials automatically.");
+  w.classList.toggle("hide",!lines.length); w.textContent=lines.join(" ");
+  const n=$("#sharedinfo"), info=[];
+  if(shared.length)info.push("ⓘ Visible to everyone who can log in, but each person supplies their own credentials: "+shared.join(", ")+". Anyone you add later will see these.");
+  if(gs.length)info.push("ⓘ Saved credentials shared by every member of a group, so the target's own logs cannot tell them apart: "+gs.join(", ")+".");
+  n.classList.toggle("hide",!info.length); n.textContent=info.join(" ");
+}
+function showSub(n){
+  $$(".subtabs button").forEach(b=>b.classList.toggle("on",b.dataset.s===n));
+  for(const k of ["systems","people","logins"])$("#st_"+k).classList.toggle("hide",k!==n);
+  if(n==="people")renderPeople(); if(n==="logins")renderLogins(); if(n==="systems")tList();
+}
+$$(".subtabs button").forEach(b=>b.onclick=()=>showSub(b.dataset.s));
+function fillKnown(){const dl=$("#knownUsers");dl.textContent="";new Set(allUsers().concat(cfgUsers.emails)).forEach(u=>{const o=el("option");o.value=u;dl.appendChild(o)})}
+/* systems */
 function tShowFields(){const p=$("#t_protocol").value;
-  $$("#tform>.grid .rdp").forEach(e=>e.classList.toggle("hide",p!=="rdp")); $$("#tform>.grid .ssh").forEach(e=>e.classList.toggle("hide",p!=="ssh"));}
+  $$("#tform .rdp").forEach(e=>e.classList.toggle("hide",p!=="rdp")); $$("#tform .ssh").forEach(e=>e.classList.toggle("hide",p!=="ssh"));}
 function tFill(){
-  const t=systems[sel]; $("#tform").classList.toggle("hide",!t); if(!t){renderAcc();return}
-  for(const k of SYS)$("#t_"+k).value=t[k]??"";
-  $("#t_ignore_cert").checked=!!t.ignore_cert; tShowFields(); renderAcc();
+  const t=systems[sel]; $("#tform").classList.toggle("hide",!t); if(!t)return;
+  for(const k of SYS)$("#t_"+k).value=t[k]??""; $("#t_ignore_cert").checked=!!t.ignore_cert; tShowFields();
+  const n=logins.filter(l=>l.sys===t).length; $("#t_sysinfo").textContent=n+" login(s) use this system. Add or change them on the Logins tab.";
 }
 function tWrite(){
   const t=systems[sel]; if(!t)return;
-  const proto=t.protocol;
   for(const k of SYS)t[k]=$("#t_"+k).value; t.ignore_cert=$("#t_ignore_cert").checked; tShowFields(); tList();
-  if(t.protocol!==proto)renderAcc();
 }
 function tList(){
   const box=$("#tlist"); box.textContent="";
-  systems.forEach((t,i)=>{const d=document.createElement("div"); d.className=i===sel?"on":"";
-    d.textContent=(isOpen(t)?"⚠ ":isShared(t)?"ⓘ ":"")+(t.name||"(unnamed)"); const s=document.createElement("small");
-    s.textContent=t.protocol+" "+(t.host||"")+" · "+t.access.length+" access"; d.appendChild(s);
+  systems.forEach((t,i)=>{const d=el("div",i===sel?"on":"",(isOpen(t)?"⚠ ":isShared(t)?"ⓘ ":"")+(t.name||"(unnamed)"));
+    const s=el("small","",t.protocol+" "+(t.host||"")+" · "+logins.filter(l=>l.sys===t).length+" login(s)"); d.appendChild(s);
     d.onclick=()=>{sel=i;tList();tFill()}; box.appendChild(d);});
-  const open=systems.filter(isOpen).map(t=>t.name||"(unnamed)"), w=$("#openwarn");
-  w.classList.toggle("hide",!open.length);
-  w.textContent=open.length?"⚠ Saved credentials open to everyone who can log in: "+open.join(", ")+". Anyone you add to your identity provider later gets use of these credentials automatically. Give each person their own access entry instead if that is not what you want.":"";
-  const sh=systems.filter(x=>isShared(x)&&!isOpen(x)).map(x=>x.name||"(unnamed)"), n=$("#sharedinfo");
-  n.classList.toggle("hide",!sh.length);
-  n.textContent=sh.length?"ⓘ Visible to everyone who can log in, but each person must supply their own credentials: "+sh.join(", ")+". Anyone you add later will see these systems in their list.":"";
+  refreshFlags();
 }
-function el(tag,cls,text){const e=document.createElement(tag);if(cls)e.className=cls;if(text!==undefined)e.textContent=text;return e}
-function addRow(grid,label,node){const l=el("label","",label);grid.appendChild(l);grid.appendChild(node);return node}
-function inp(a,k,type,ph){const i=el("input");i.type=type||"text";i.autocomplete="off";i.value=a[k];if(ph)i.placeholder=ph;
-  i.oninput=()=>{const was=hasSaved(a);a[k]=i.value;if(was!==hasSaved(a)&&a.who==="all"){tList();renderAccKeepFocus(i)}};return i}
-function renderAccKeepFocus(i){const idx=[...document.querySelectorAll("#acc input,#acc textarea")].indexOf(i),pos=i.selectionStart;renderAcc();
-  const n=[...document.querySelectorAll("#acc input,#acc textarea")][idx];if(n){n.focus();try{n.setSelectionRange(pos,pos)}catch(e){}}}
-function sel_(a,k,opts){const s=el("select");for(const [v,t] of opts){const o=el("option","",t);o.value=v;s.appendChild(o)}s.value=a[k];
-  s.onchange=()=>{a[k]=s.value;tList();renderAcc()};return s}
-function renderAcc(){
-  const s=systems[sel], box=$("#acc"); box.textContent=""; if(!s)return;
-  const known=new Set(cfgUsers.emails); systems.forEach(x=>x.access.forEach(a=>{if(a.email)known.add(a.email.trim().toLowerCase())}));
-  const dl=$("#knownUsers"); dl.textContent=""; known.forEach(u=>{const o=el("option");o.value=u;dl.appendChild(o)});
-  if(!s.access.length)box.appendChild(el("div","sub","No access entries: nobody can see this system yet. Add one."));
-  s.access.forEach((a,i)=>{
-    const card=el("div","acc"+(a.who==="all"&&hasSaved(a)?" open":"")), g=el("div","grid");
-    addRow(g,"Who",sel_(a,"who",[["user","One person"],["all","Everyone who can log in"]]));
-    if(a.who==="user"){
-      const em=inp(a,"email","text","person@example.com"); em.setAttribute("list","knownUsers");
-      const hint=el("div","hint",userHint(a.email)); em.oninput=()=>{a.email=em.value;hint.textContent=userHint(em.value)};
-      addRow(g,"Email",em); card.appendChild(g); card.appendChild(hint);
-    }else{
-      card.appendChild(g);
-      card.appendChild(el("div","hint",hasSaved(a)?"⚠ Everyone who can log in can use these saved credentials, including anyone you add later."
-        :"ⓘ Everyone who can log in sees this system, including anyone you add later. They must enter their own credentials."));
-    }
-    const g2=el("div","grid");
-    addRow(g2,"Credentials",sel_(a,"cred",[["ask","Ask them when they connect"],["saved","Use saved credentials"]]));
-    if(a.cred==="saved"){
-      addRow(g2,"Username",inp(a,"username"));
-      addRow(g2,"Password",inp(a,"password","password"));
-      if(s.protocol==="rdp")addRow(g2,"Windows domain",inp(a,"domain","text","optional"));
-      else{const ta=el("textarea","small");ta.spellcheck=false;ta.value=a.private_key;ta.placeholder="-----BEGIN OPENSSH PRIVATE KEY----- (optional)";ta.oninput=()=>{a.private_key=ta.value};
-        addRow(g2,"Private key",ta);addRow(g2,"Key passphrase",inp(a,"passphrase","password"))}
-    }
-    card.appendChild(g2);
-    const r=el("div","row"),rm=el("button","","Remove access");rm.onclick=()=>{s.access.splice(i,1);tList();renderAcc()};r.appendChild(rm);card.appendChild(r);
-    box.appendChild(card);
+/* people and groups */
+function renderPeople(){
+  const ul=$("#ulist"); ul.textContent=""; fillKnown();
+  const all=allUsers(); if(!all.length)ul.appendChild(el("div","sub","No people yet."));
+  all.forEach(u=>{
+    const r=el("div","urow"); r.appendChild(el("b","",u));
+    const gn=groups.filter(g=>g.users.map(lc).includes(u)).map(g=>g.name||"(unnamed)");
+    const n=logins.filter(l=>l.who==="user"&&lc(l.user)===u).length;
+    r.appendChild(el("span","sub","groups: "+(gn.join(", ")||"none")+" · "+n+" login(s)"));
+    const h=userHint(u); if(h)r.appendChild(el("span","hint",h));
+    const add=el("button","","Add login"); add.onclick=()=>{const l=blankLogin();l.user=u;logins.push(l);showSub("logins");$("#l_filter").value="u:"+u;renderLogins()};
+    const rm=el("button","","Remove");
+    rm.onclick=()=>{if(!confirm("Remove "+u+", their group memberships and their "+n+" login(s)? (Not final until you press Save targets.)"))return;
+      users=users.filter(x=>lc(x)!==u); groups.forEach(g=>{g.users=g.users.filter(x=>lc(x)!==u)}); logins=logins.filter(l=>!(l.who==="user"&&lc(l.user)===u)); renderPeople();refreshFlags()};
+    r.appendChild(add); r.appendChild(rm); ul.appendChild(r);
+  });
+  const gl=$("#glist"); gl.textContent=""; if(!groups.length)gl.appendChild(el("div","sub","No groups yet."));
+  groups.forEach(g=>{
+    const card=el("div","acc"), grid=el("div","grid");
+    const nm=el("input");nm.type="text";nm.value=g.name;nm.placeholder="group name";nm.oninput=()=>{g.name=nm.value};
+    const ta=el("textarea","small");ta.spellcheck=false;ta.value=g.users.join("\n");ta.placeholder="one email per line";
+    ta.oninput=()=>{g.users=ta.value.split(/\n/).map(lc).filter(Boolean)}; ta.onchange=()=>renderPeople();
+    addRow(grid,"Group name",nm); addRow(grid,"Members",ta); card.appendChild(grid);
+    const n=logins.filter(l=>l.grp===g).length, rm=el("button","","Remove group");
+    rm.onclick=()=>{if(!confirm("Remove group "+(g.name||"(unnamed)")+" and its "+n+" login(s)? (Not final until you press Save targets.)"))return;
+      groups=groups.filter(x=>x!==g); logins=logins.filter(l=>l.grp!==g); renderPeople();refreshFlags()};
+    const r=el("div","row");r.appendChild(rm);card.appendChild(r); gl.appendChild(card);
   });
 }
+$("#u_add").onclick=()=>{const v=lc($("#u_new").value); if(!v)return; if(!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(v)){alert("That is not an email address.");return}
+  if(!users.includes(v))users.push(v); $("#u_new").value=""; renderPeople()};
+$("#g_add").onclick=()=>{groups.push({name:"",users:[]});renderPeople();const i=$$("#glist input");if(i.length)i[i.length-1].focus()};
+/* logins */
+function fillFilter(){
+  const f=$("#l_filter"), cur=f.value; f.textContent="";
+  const add=(v,t)=>{const o=el("option","",t);o.value=v;f.appendChild(o)};
+  add("all","All logins"); add("everyone","Everyone logins");
+  allUsers().forEach(u=>add("u:"+u,"Person: "+u)); groups.forEach(g=>add("g:"+g.name,"Group: "+(g.name||"(unnamed)"))); systems.forEach(s=>add("s:"+s.name,"System: "+(s.name||"(unnamed)")));
+  f.value=cur; if(f.value!==cur)f.value="all";
+}
+function matches(l,f){
+  if(!f||f==="all")return true; if(f==="everyone")return l.who==="all";
+  const v=f.slice(2); if(f.startsWith("u:"))return l.who==="user"&&lc(l.user)===v;
+  if(f.startsWith("g:"))return l.who==="group"&&!!l.grp&&l.grp.name===v; if(f.startsWith("s:"))return !!l.sys&&l.sys.name===v; return true;
+}
+function loginCard(l){
+  const card=el("div","acc"), g=el("div","grid"), hint=el("div","hint");
+  const upd=()=>{const open=openLogin(l); card.className="acc"+(open?" open":"");
+    hint.className="hint"+(open?"":" info");
+    hint.textContent=l.who==="all"?(hasSaved(l)?"⚠ Everyone who can log in can use these saved credentials, including anyone you add later.":"ⓘ Everyone who can log in sees this system, including anyone you add later. They must enter their own credentials.")
+      :l.who==="group"?(hasSaved(l)?"ⓘ Every member of the group shares these saved credentials, so the target's own logs cannot tell them apart.":"")
+      :userHint(l.user); hint.style.display=hint.textContent?"":"none";};
+  const redo=()=>{renderLogins();refreshFlags()};
+  addRow(g,"Who",valSelect(l,"who",[["user","One person"],["group","A group"],["all","Everyone who can log in"]],redo));
+  if(l.who==="user"){const em=inp(l,"user","text","person@example.com"); em.setAttribute("list","knownUsers"); const base=em.oninput;
+    em.oninput=()=>{base();upd()}; em.onchange=()=>{fillKnown();refreshFlags()}; addRow(g,"Person",em)}
+  if(l.who==="group")addRow(g,"Group",objSelect(groups,l.grp,x=>x.name,x=>{l.grp=x;refreshFlags()}));
+  addRow(g,"System",objSelect(systems,l.sys,x=>x.name,x=>{l.sys=x;redo()}));
+  addRow(g,"Credentials",valSelect(l,"cred",[["ask","Ask them when they connect"],["saved","Use saved credentials"]],redo));
+  if(l.cred==="saved"){
+    const flip=()=>{upd();refreshFlags();tList()};
+    addRow(g,"Username",inp(l,"username","text","",flip)); addRow(g,"Password",inp(l,"password","password","",flip));
+    if(!l.sys||l.sys.protocol==="rdp")addRow(g,"Windows domain",inp(l,"domain","text","optional",flip));
+    if(l.sys&&l.sys.protocol==="ssh"){const ta=el("textarea","small");ta.spellcheck=false;ta.value=l.private_key;ta.placeholder="-----BEGIN OPENSSH PRIVATE KEY----- (optional)";
+      ta.oninput=()=>{const was=hasSaved(l);l.private_key=ta.value;if(was!==hasSaved(l))flip()}; addRow(g,"Private key",ta); addRow(g,"Key passphrase",inp(l,"passphrase","password","",flip))}
+  }
+  card.appendChild(g); card.appendChild(hint);
+  const rm=el("button","","Remove login"); rm.onclick=()=>{logins=logins.filter(x=>x!==l);redo()}; const r=el("div","row");r.appendChild(rm);card.appendChild(r);
+  upd(); return card;
+}
+function renderLogins(){
+  fillFilter(); fillKnown(); const box=$("#llist"); box.textContent=""; const f=$("#l_filter").value;
+  const shown=logins.filter(l=>matches(l,f));
+  if(!shown.length)box.appendChild(el("div","sub",logins.length?"No logins match this filter.":(systems.length?"No logins yet. Nobody can connect to anything until you add one.":"Add a system first (Systems tab), then give people logins here.")));
+  shown.forEach(l=>box.appendChild(loginCard(l)));
+}
+$("#l_filter").onchange=renderLogins;
+$("#l_add").onclick=()=>{const l=blankLogin(), f=$("#l_filter").value;
+  if(f==="everyone")l.who="all"; else if(f.startsWith("u:"))l.user=f.slice(2); else if(f.startsWith("g:")){l.who="group";l.grp=groups.find(g=>g.name===f.slice(2))||null}
+  else if(f.startsWith("s:"))l.sys=systems.find(s=>s.name===f.slice(2))||null;
+  if(!l.sys&&systems.length===1)l.sys=systems[0];
+  logins.push(l); renderLogins(); refreshFlags(); tList()};
 async function loadTargets(){
-  const r=await api("/api/targets"); systems=fromFile(r.data||[]); sel=systems.length?0:-1;
+  const r=await api("/api/targets"); fromFile(r.data||{}); sel=systems.length?0:-1;
   try{const c=await api("/api/config"); const d=c.data||{};
-    cfgUsers={emails:(d.emails||[]).map(x=>String(x).toLowerCase()),groups:d.groups||[]}}catch(e){}
+    cfgUsers={emails:(d.emails||[]).map(lc),groups:d.groups||[],domains:d.domains||[]}}catch(e){}
   tList(); tFill();
-  $("#tstatus").textContent=!r.exists?"No targets.yaml yet. Add a system and save.":"Current file: "+r.status;
+  $("#tstatus").textContent=!r.exists?"No targets.yaml yet. Add a system, then a login, and save.":
+    (r.converted?"This file uses the older flat format; it is shown converted and will be saved in the new format. ":"Current file: ")+r.status;
 }
 async function tAction(kind){
   const m=$("#tmsg");
@@ -1246,11 +1339,13 @@ async function tAction(kind){
     if(kind==="save"&&r.saved){await loadFile();$("#tstatus").textContent="Saved.";$("#t_apply").classList.remove("hide")}
   }catch(e){m.className="msg bad";m.textContent="✘ "+e.message}
 }
-$$("#tform>.grid input,#tform>.grid select").forEach(e=>{e.oninput=tWrite;e.onchange=tWrite});
+$$("#tform .grid input,#tform .grid select").forEach(e=>{e.oninput=tWrite;e.onchange=tWrite});
 $("#tform").addEventListener("input",()=>$("#t_apply").classList.add("hide"));
+["st_people","st_logins"].forEach(i=>$("#"+i).addEventListener("input",()=>$("#t_apply").classList.add("hide")));
 $("#t_add").onclick=()=>{systems.push(blankSys());sel=systems.length-1;tList();tFill();$("#t_name").focus()};
-$("#a_add").onclick=()=>{const s=systems[sel];if(!s)return;s.access.push(blankAcc());tList();renderAcc()};
-$("#t_del").onclick=()=>{if(sel<0)return;if(!confirm("Delete system \""+(systems[sel].name||"unnamed")+"\" and all its access entries? (Not final until you press Save targets.)"))return;systems.splice(sel,1);sel=Math.min(sel,systems.length-1);tList();tFill()};
+$("#t_del").onclick=()=>{if(sel<0)return;const s=systems[sel],n=logins.filter(l=>l.sys===s).length;
+  if(!confirm("Delete system \""+(s.name||"unnamed")+"\" and its "+n+" login(s)? (Not final until you press Save targets.)"))return;
+  logins=logins.filter(l=>l.sys!==s); systems.splice(sel,1); sel=Math.min(sel,systems.length-1); tList(); tFill()};
 $("#t_validate").onclick=()=>tAction("validate"); $("#t_save").onclick=()=>tAction("save");
 async function loadForms(){await loadCfg();await loadTargets()}
 

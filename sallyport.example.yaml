@@ -25,8 +25,13 @@ idp:
   client_secret: change-me
   scopes: [openid, profile, email]
 
-# Who may reach Sallyport at all. Anyone Pomerium admits becomes a Guacamole
-# user who can see every target. At least one entry is required.
+# Who may reach Sallyport at all. This is a gate in front of Guacamole, separate from which
+# systems each person sees (targets.yaml). Emails, groups and domains are alternatives: matching
+# any one admits the person. If you list NONE of them, anyone your identity provider
+# authenticates is admitted. That is fine when the identity provider's own application for
+# Sallyport restricts who can sign in (for Auth0 you must configure that; it is not the default).
+# It is refused for providers that authenticate the general public (Google, Microsoft "common").
+# Anyone admitted who has no login of their own sees only the logins marked "everyone".
 access:
   # Exact email addresses (as the IdP asserts them).
   emails:
@@ -37,6 +42,8 @@ access:
   # in again, so keep session.lifetime short.
   groups: []
   groups_claim: groups
+  # Email domains, for example example.com.
+  domains: []
 
 session:
   lifetime: 8h # how long a login lasts before the user must sign in again

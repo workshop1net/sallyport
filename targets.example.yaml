@@ -1,52 +1,78 @@
-# Systems that Sallyport users may connect to. Copy to targets.yaml and edit, then
-# run ./sallyport load-targets. targets.yaml contains credentials: it is in
-# .gitignore, and should be readable only by the account running Sallyport.
+# Who may connect to what. Copy to targets.yaml and edit, then run ./sallyport load-targets
+# (or use the GUI's Targets tab, which edits this file). targets.yaml contains credentials: it
+# is in .gitignore, and should be readable only by the account running Sallyport.
 #
-# MVP: credentials are stored in the Guacamole database in plain text. Use
-# dedicated service accounts with least privilege, never personal credentials.
+# MVP: credentials are stored in the Guacamole database in plain text. Use dedicated service
+# accounts with least privilege, ideally one per person so the target's own logs show who did what.
 #
 # Unknown keys are rejected on purpose, so a typo cannot silently weaken a setting.
 #
-# Who sees a target:
-#   users: [a@example.com]   only these people (lower-case email, as the IdP reports it)
-#   users: []                nobody (the GUI uses this to keep a system with no access entries)
-#   (no users line)          EVERYONE who can log in, including anyone added later. Use sparingly.
-# Connection names must be unique, so one system for several people is several entries, e.g.
-# "dc01 (alice@example.com)" and "dc01 (bob@example.com)", each with that person's own credentials.
-# username/password/private_key are optional: leave them out and Guacamole asks the user
-# for credentials when they connect.
+# Four lists:
+#   systems  the machines people can connect to
+#   users    people you give logins to or put in groups (optional; the GUI keeps this list)
+#   groups   named lists of people, used to decide who sees a login
+#   logins   who may use which system, and with which credentials
+#
+# Who is "everyone"? Anyone who gets through the identity provider (and Allowed emails etc. in
+# sallyport.yaml), including people you add to the identity provider LATER. A login for everyone
+# with saved credentials hands those credentials to all of them, so use it sparingly. A login for
+# everyone with no saved credentials only shows the system; each person supplies their own.
+#
+# Each login becomes one connection named "<system> (<person or group>)", or just "<system>"
+# for everyone, so max_sessions applies to each connection separately.
 
-targets:
+systems:
   - name: dc01
     protocol: rdp
     host: 10.0.0.10
     # port: 3389
-    username: svc-sallyport
-    password: change-me
-    # domain: CORP
     security: nla          # nla (default) | tls | rdp | any
-    ignore_cert: false     # true accepts the server's self-signed RDP certificate
-                           # without checking it, which allows interception
-                           # on the path between guacd and the target
+    ignore_cert: false     # true accepts the server's self-signed RDP certificate without
+                           # checking it, which allows interception between guacd and the target
     clipboard: both        # both (default) | none | paste-only | copy-only
                            # paste-only: user to target; copy-only: target to user
-    max_sessions: 1        # simultaneous sessions on this connection
-    # users: [alice@example.com]
+    max_sessions: 1        # simultaneous sessions on each connection
 
   - name: fw01
     protocol: ssh
     host: 10.0.0.1
-    username: svc-sallyport
-    private_key: |
-      -----BEGIN OPENSSH PRIVATE KEY-----
-      ...
-      -----END OPENSSH PRIVATE KEY-----
-    # passphrase: change-me
-    # password: change-me  # alternative to private_key
-    host_key: "ssh-ed25519 AAAA..."  # strongly recommended: without it guacd
-                                     # accepts any host key
-    clipboard: both
+    host_key: "ssh-ed25519 AAAA..."  # strongly recommended: without it guacd accepts any host key
+
+users:
+  - alice@example.com
+  - bob@example.com
+
+groups:
+  - name: netops
+    users: [alice@example.com, bob@example.com]
+
+logins:
+  # Alice has her own account on dc01.
+  - system: dc01
+    user: alice@example.com
+    username: alice-admin
+    password: change-me
+    # domain: CORP
+  # Bob is asked for his credentials when he connects (no username or password stored).
+  - system: dc01
+    user: bob@example.com
+  # Members of netops see fw01 and sign in themselves. A group login WITH saved credentials would
+  # be a shared account: the target's logs could not tell the members apart.
+  - system: fw01
+    group: netops
+  # - system: dc01
+  #   everyone: true       # any user who gets through the identity provider sees dc01 and is asked for credentials
+  # - system: fw01
+  #   user: bob@example.com
+  #   username: bob
+  #   private_key: |
+  #     -----BEGIN OPENSSH PRIVATE KEY-----
+  #     ...
+  #     -----END OPENSSH PRIVATE KEY-----
+  #   # passphrase: change-me
 
 # VNC is deliberately not supported.
-# File transfer (RDP drive redirection, RDP upload/download, SFTP) and printing are
-# always off. There is deliberately no option to enable them in the MVP.
+# File transfer (RDP drive redirection, RDP upload/download, SFTP) and printing are always off.
+# There is deliberately no option to enable them in the MVP.
+#
+# The older flat format (a single "targets:" list, one entry per connection) is still accepted.
